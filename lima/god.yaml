@@ -1,0 +1,107 @@
+# Lima VM template for veleiro-god development
+# Configures Docker, uv, Claude Code, and nested virtualization
+#
+# Usage:
+#   limactl start lima/god.yaml
+#   limactl shell god
+#
+# To use Docker from host:
+#   docker context create lima-god --docker "host=unix://$(limactl list god --format '{{.Dir}}')/sock/docker.sock"
+#   docker context use lima-god
+
+# Use Ubuntu LTS base (not docker template to avoid inheriting ~ mount)
+images:
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+  arch: "x86_64"
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+
+nestedVirtualization: true
+
+memory: 16GiB
+
+# Only mount what we need - no ~ mount
+mounts:
+- location: "~/workplace/veleiro-god"
+  writable: true
+- location: "~/.claude"
+  writable: true
+
+# Forward docker socket to host
+portForwards:
+- guestSocket: "/run/user/{{.UID}}/docker.sock"
+  hostSocket: "{{.Dir}}/sock/docker.sock"
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    # Install Docker
+    if ! command -v docker &> /dev/null; then
+      export DEBIAN_FRONTEND=noninteractive
+      curl -fsSL https://get.docker.com | sh
+      # Use rootless docker
+      systemctl disable --now docker
+      apt-get install -y uidmap dbus-user-session
+    fi
+    # Install Node.js LTS (required for Claude Code)
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+    apt-get install -y nodejs make
+    # Install uv for root and make it available system-wide
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    ln -sf /root/.local/bin/uv /usr/local/bin/uv
+    ln -sf /root/.local/bin/uvx /usr/local/bin/uvx
+    # Create directory for VM-local venv (owned by lima user)
+    mkdir -p /opt/god
+    chown "${LIMA_CIDATA_USER}:${LIMA_CIDATA_USER}" /opt/god
+    chmod 755 /opt/god
+    # Preserve UV_PROJECT_ENVIRONMENT when using sudo
+    echo 'Defaults env_keep += "UV_PROJECT_ENVIRONMENT"' > /etc/sudoers.d/uv-env
+    chmod 440 /etc/sudoers.d/uv-env
+    # Set UV_PROJECT_ENVIRONMENT globally (for all users including root)
+    echo 'export UV_PROJECT_ENVIRONMENT=/opt/god/venv' > /etc/profile.d/god.sh
+    # Install ghostty terminfo for proper terminal support
+    echo 'IwlSZWNvbnN0cnVjdGVkIHZpYSBpbmZvY21wIGZyb20gZmlsZTogL0FwcGxpY2F0aW9ucy9HaG9zdHR5LmFwcC9Db250ZW50cy9SZXNvdXJjZXMvdGVybWluZm8vNzgveHRlcm0tZ2hvc3R0eQp4dGVybS1naG9zdHR5fGdob3N0dHl8R2hvc3R0eSwKCWFtLCBiY2UsIGNjYywgaHMsIGttLCBtYzVpLCBtaXIsIG1zZ3IsIG5wYywgeGVubCwgQVgsIFN1LCBUYywgWFQsIGZ1bGxrYmQsCgljb2xvcnMjMjU2LCBjb2xzIzgwLCBpdCM4LCBsaW5lcyMyNCwgcGFpcnMjMzI3NjcsCglhY3NjPSsrXCxcLC0tLi4wMGBgYWFmZmdnaGhpaWpqa2tsbG1tbm5vb3BwcXFycnNzdHR1dXZ2d3d4eHl5enp7e3x8fX1+fiwKCWJlbD1eRywgYmxpbms9XEVbNW0sIGJvbGQ9XEVbMW0sIGNidD1cRVtaLCBjaXZpcz1cRVs/MjVsLAoJY2xlYXI9XEVbSFxFWzJKLCBjbm9ybT1cRVs/MTJsXEVbPzI1aCwgY3I9Xk0sCgljc3I9XEVbJWklcDElZDslcDIlZHIsIGN1Yj1cRVslcDElZEQsIGN1YjE9XkgsCgljdWQ9XEVbJXAxJWRCLCBjdWQxPV5KLCBjdWY9XEVbJXAxJWRDLCBjdWYxPVxFW0MsCgljdXA9XEVbJWklcDElZDslcDIlZEgsIGN1dT1cRVslcDElZEEsIGN1dTE9XEVbQSwKCWN2dmlzPVxFWz8xMjsyNWgsIGRjaD1cRVslcDElZFAsIGRjaDE9XEVbUCwgZGltPVxFWzJtLAoJZGw9XEVbJXAxJWRNLCBkbDE9XEVbTSwgZHNsPVxFXTI7XDAwNywgZWNoPVxFWyVwMSVkWCwKCWVkPVxFW0osIGVsPVxFW0ssIGVsMT1cRVsxSywgZmxhc2g9XEVbPzVoJDwxMDAvPlxFWz81bCwKCWZzbD1eRywgaG9tZT1cRVtILCBocGE9XEVbJWklcDElZEcsIGh0PV5JLCBodHM9XEVILAoJaWNoPVxFWyVwMSVkQCwgaWNoMT1cRVtALCBpbD1cRVslcDElZEwsIGlsMT1cRVtMLCBpbmQ9XkosCglpbmRuPVxFWyVwMSVkUywKCWluaXRjPVxFXTQ7JXAxJWQ7cmdiXDolcDIlezI1NX0lKiV7MTAwMH0lLyUyLjJYLyVwMyV7MjU1fSUqJXsxMDAwfSUvJTIuMlgvJXA0JXsyNTV9JSolezEwMDB9JS8lMi4yWFxFXFwsCglpbnZpcz1cRVs4bSwga0RDPVxFWzM7Mn4sIGtFTkQ9XEVbMTsyRiwga0hPTT1cRVsxOzJILAoJa0lDPVxFWzI7Mn4sIGtMRlQ9XEVbMTsyRCwga05YVD1cRVs2OzJ+LCBrUFJWPVxFWzU7Mn4sCglrUklUPVxFWzE7MkMsIGticz1cMTc3LCBrY2J0PVxFW1osIGtjdWIxPVxFT0QsIGtjdWQxPVxFT0IsCglrY3VmMT1cRU9DLCBrY3V1MT1cRU9BLCBrZGNoMT1cRVszfiwga2VuZD1cRU9GLCBrZW50PVxFT00sCglrZjE9XEVPUCwga2YxMD1cRVsyMX4sIGtmMTE9XEVbMjN+LCBrZjEyPVxFWzI0fiwKCWtmMTM9XEVbMTsyUCwga2YxND1cRVsxOzJRLCBrZjE1PVxFWzE7MlIsIGtmMTY9XEVbMTsyUywKCWtmMTc9XEVbMTU7Mn4sIGtmMTg9XEVbMTc7Mn4sIGtmMTk9XEVbMTg7Mn4sIGtmMj1cRU9RLAoJa2YyMD1cRVsxOTsyfiwga2YyMT1cRVsyMDsyfiwga2YyMj1cRVsyMTsyfiwKCWtmMjM9XEVbMjM7Mn4sIGtmMjQ9XEVbMjQ7Mn4sIGtmMjU9XEVbMTs1UCwga2YyNj1cRVsxOzVRLAoJa2YyNz1cRVsxOzVSLCBrZjI4PVxFWzE7NVMsIGtmMjk9XEVbMTU7NX4sIGtmMz1cRU9SLAoJa2YzMD1cRVsxNzs1fiwga2YzMT1cRVsxODs1fiwga2YzMj1cRVsxOTs1fiwKCWtmMzM9XEVbMjA7NX4sIGtmMzQ9XEVbMjE7NX4sIGtmMzU9XEVbMjM7NX4sCglrZjM2PVxFWzI0OzV+LCBrZjM3PVxFWzE7NlAsIGtmMzg9XEVbMTs2USwga2YzOT1cRVsxOzZSLAoJa2Y0PVxFT1MsIGtmNDA9XEVbMTs2Uywga2Y0MT1cRVsxNTs2fiwga2Y0Mj1cRVsxNzs2fiwKCWtmNDM9XEVbMTg7Nn4sIGtmNDQ9XEVbMTk7Nn4sIGtmNDU9XEVbMjA7Nn4sCglrZjQ2PVxFWzIxOzZ+LCBrZjQ3PVxFWzIzOzZ+LCBrZjQ4PVxFWzI0OzZ+LAoJa2Y0OT1cRVsxOzNQLCBrZjU9XEVbMTV+LCBrZjUwPVxFWzE7M1EsIGtmNTE9XEVbMTszUiwKCWtmNTI9XEVbMTszUywga2Y1Mz1cRVsxNTszfiwga2Y1ND1cRVsxNzszfiwKCWtmNTU9XEVbMTg7M34sIGtmNTY9XEVbMTk7M34sIGtmNTc9XEVbMjA7M34sCglrZjU4PVxFWzIxOzN+LCBrZjU5PVxFWzIzOzN+LCBrZjY9XEVbMTd+LCBrZjYwPVxFWzI0OzN+LAoJa2Y2MT1cRVsxOzRQLCBrZjYyPVxFWzE7NFEsIGtmNjM9XEVbMTs0Uiwga2Y3PVxFWzE4fiwKCWtmOD1cRVsxOX4sIGtmOT1cRVsyMH4sIGtob21lPVxFT0gsIGtpY2gxPVxFWzJ+LAoJa2luZD1cRVsxOzJCLCBrbW91cz1cRVs8LCBrbnA9XEVbNn4sIGtwcD1cRVs1fiwKCWtyaT1cRVsxOzJBLCBvYz1cRV0xMDRcMDA3LCBvcD1cRVszOTs0OW0sIHJjPVxFOCwKCXJlcD0lcDElY1xFWyVwMiV7MX0lLSVkYiwgcmV2PVxFWzdtLCByaT1cRU0sCglyaW49XEVbJXAxJWRULCByaXRtPVxFWzIzbSwgcm1hY3M9XEUoQiwgcm1hbT1cRVs/N2wsCglybWN1cD1cRVs/MTA0OWwsIHJtaXI9XEVbNGwsIHJta3g9XEVbPzFsXEU+LCBybXNvPVxFWzI3bSwKCXJtdWw9XEVbMjRtLCByczE9XEVdXEVcXFxFYywgc2M9XEU3LAoJc2V0YWI9XEVbJT8lcDElezh9JTwldDQlcDElZCVlJXAxJXsxNn0lPCV0MTAlcDElezh9JS0lZCVlNDg7NTslcDElZCU7bSwKCXNldGFmPVxFWyU/JXAxJXs4fSU8JXQzJXAxJWQlZSVwMSV7MTZ9JTwldDklcDElezh9JS0lZCVlMzg7NTslcDElZCU7bSwKCXNncj0lPyVwOSV0XEUoMCVlXEUoQiU7XEVbMCU/JXA2JXQ7MSU7JT8lcDIldDs0JTslPyVwMSVwMyV8JXQ7NyU7JT8lcDQldDs1JTslPyVwNyV0OzglO20sCglzZ3IwPVxFKEJcRVttLCBzaXRtPVxFWzNtLCBzbWFjcz1cRSgwLCBzbWFtPVxFWz83aCwKCXNtY3VwPVxFWz8xMDQ5aCwgc21pcj1cRVs0aCwgc21reD1cRVs/MWhcRT0sIHNtc289XEVbN20sCglzbXVsPVxFWzRtLCB0YmM9XEVbM2csIHRzbD1cRV0yOywgdTY9XEVbJWklZDslZFIsIHU3PVxFWzZuLAoJdTg9XEVbPyVbOzAxMjM0NTY3ODldYywgdTk9XEVbYywgdnBhPVxFWyVpJXAxJWRkLAoJQkQ9XEVbPzIwMDRsLCBCRT1cRVs/MjAwNGgsIENsbWc9XEVbcywKCUNtZz1cRVslaSVwMSVkOyVwMiVkcywgRHNtZz1cRVs/NjlsLCBFMz1cRVszSiwKCUVubWc9XEVbPzY5aCwgTXM9XEVdNTI7JXAxJXM7JXAyJXNcMDA3LCBQRT1cRVsyMDF+LAoJUFM9XEVbMjAwfiwgUlY9XEVbPmMsIFNlPVxFWzIgcSwKCVNldHVsYz1cRVs1OFw6Mlw6XDolcDElezY1NTM2fSUvJWRcOiVwMSV7MjU2fSUvJXsyNTV9JSYlZFw6JXAxJXsyNTV9JSYlZCU7bSwKCVNtdWx4PVxFWzRcOiVwMSVkbSwgU3M9XEVbJXAxJWQgcSwKCVN5bmM9XEVbPzIwMjYlPyVwMSV7MX0lLSV0bCVlaCU7LAoJWE09XEVbPzEwMDY7MTAwMCU/JXAxJXsxfSU9JXRoJWVsJTssIFhSPVxFWz4wcSwKCWZkPVxFWz8xMDA0bCwgZmU9XEVbPzEwMDRoLCBrREMzPVxFWzM7M34sIGtEQzQ9XEVbMzs0fiwKCWtEQzU9XEVbMzs1fiwga0RDNj1cRVszOzZ+LCBrREM3PVxFWzM7N34sIGtETj1cRVsxOzJCLAoJa0ROMz1cRVsxOzNCLCBrRE40PVxFWzE7NEIsIGtETjU9XEVbMTs1Qiwga0RONj1cRVsxOzZCLAoJa0RONz1cRVsxOzdCLCBrRU5EMz1cRVsxOzNGLCBrRU5END1cRVsxOzRGLAoJa0VORDU9XEVbMTs1Riwga0VORDY9XEVbMTs2Riwga0VORDc9XEVbMTs3RiwKCWtIT00zPVxFWzE7M0gsIGtIT000PVxFWzE7NEgsIGtIT001PVxFWzE7NUgsCglrSE9NNj1cRVsxOzZILCBrSE9NNz1cRVsxOzdILCBrSUMzPVxFWzI7M34sIGtJQzQ9XEVbMjs0fiwKCWtJQzU9XEVbMjs1fiwga0lDNj1cRVsyOzZ+LCBrSUM3PVxFWzI7N34sIGtMRlQzPVxFWzE7M0QsCglrTEZUND1cRVsxOzRELCBrTEZUNT1cRVsxOzVELCBrTEZUNj1cRVsxOzZELAoJa0xGVDc9XEVbMTs3RCwga05YVDM9XEVbNjszfiwga05YVDQ9XEVbNjs0fiwKCWtOWFQ1PVxFWzY7NX4sIGtOWFQ2PVxFWzY7Nn4sIGtOWFQ3PVxFWzY7N34sCglrUFJWMz1cRVs1OzN+LCBrUFJWND1cRVs1OzR+LCBrUFJWNT1cRVs1OzV+LAoJa1BSVjY9XEVbNTs2fiwga1BSVjc9XEVbNTs3fiwga1JJVDM9XEVbMTszQywKCWtSSVQ0PVxFWzE7NEMsIGtSSVQ1PVxFWzE7NUMsIGtSSVQ2PVxFWzE7NkMsCglrUklUNz1cRVsxOzdDLCBrVVA9XEVbMTsyQSwga1VQMz1cRVsxOzNBLCBrVVA0PVxFWzE7NEEsCglrVVA1PVxFWzE7NUEsIGtVUDY9XEVbMTs2QSwga1VQNz1cRVsxOzdBLCBreElOPVxFW0ksCglreE9VVD1cRVtPLCBybXh4PVxFWzI5bSwgcnY9XEVcXFtbMC05XSs7WzAtOV0rO1swLTldK2MsCglzZXRyZ2JiPVxFWzQ4XDoyXDolcDElZFw6JXAyJWRcOiVwMyVkbSwKCXNldHJnYmY9XEVbMzhcOjJcOiVwMSVkXDolcDIlZFw6JXAzJWRtLCBzbXh4PVxFWzltLAoJeG09XEVbPCVpJXAzJWQ7JXAxJWQ7JXAyJWQ7JT8lcDQldE0lZW0lOywKCXhyPVxFUD5cXHxbIC1+XSthXEVcXCwK' | base64 -d | tic -x -
+
+- mode: user
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    # Create symlink so ~/workplace points to the mounted directory
+    ln -sf /path/to/workspace ~/workplace
+    # Setup rootless docker
+    dockerd-rootless-setuptool.sh install
+    docker context use rootless
+    # Install uv
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    # Install Claude Code
+    curl -fsSL https://claude.ai/install.sh | bash
+    # Configure uv to use VM-local venv (not mounted from host)
+    echo 'export UV_PROJECT_ENVIRONMENT=/opt/god/venv' >> ~/.bashrc
+    # Configure git author
+    git config --global user.email "your-email@example.com"
+    git config --global user.name "Nicolas Mesa"
+    # Add aliases
+    echo 'alias clskip="claude --dangerously-skip-permissions"' >> ~/.bashrc
+    echo 'alias god="sudo uv run --directory ~/workplace/veleiro-god god"' >> ~/.bashrc
+
+message: |
+  God development VM is ready!
+
+  Tools installed:
+  - Docker (rootless)
+  - uv (Python package manager) - venv at /opt/god/venv
+  - Claude Code
+
+  Mounted directories:
+  - ~/workplace/veleiro-god (writable)
+  - ~/.claude (writable)
+
+  Aliases:
+  - god: runs god CLI with sudo (works from any directory)
+  - clskip: runs Claude Code skipping permission prompts
+
+  To use Docker from the host:
+    docker context create lima-god --docker "host=unix://{{.Dir}}/sock/docker.sock"
+    docker context use lima-god

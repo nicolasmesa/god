@@ -200,15 +200,19 @@ Lima lets us run Linux VMs on macOS. Since we're on Apple Silicon, Lima will cre
 ```bash
 # Install Lima using Homebrew
 brew install lima
+```
 
-# Create and start the default VM
-limactl start default
+This project includes a custom Lima configuration (`lima/god.yaml`) that sets up everything we need: Docker, uv, Claude Code, and proper KVM access.
+
+```bash
+# From the project root, start our custom VM
+limactl start lima/god.yaml
 
 # This takes a few minutes on first run. Lima downloads an Ubuntu image
-# and sets up the VM.
+# and runs our provisioning scripts.
 
-# Once it's running, you can shell into it:
-limactl shell default
+# Once it's running, shell into it:
+limactl shell god
 ```
 
 Inside the Lima VM, verify KVM is available:
@@ -220,31 +224,43 @@ ls -la /dev/kvm
 # You should see something like:
 # crw-rw---- 1 root kvm 10, 232 Dec 26 00:00 /dev/kvm
 
-# Check if you have permission to use it
-# (Lima usually sets this up for you)
-cat /dev/kvm
-# If you get "Permission denied", you may need to add yourself to the kvm group
+# KVM requires root access, which is why we use sudo for commands
+sudo cat /dev/kvm
+# You'll see binary garbage - that's fine, it means we have access!
 ```
+
+**Note**: We need `sudo` to access KVM. The Lima VM is configured with a `god` alias that handles this automatically.
 
 ### Setting Up the Python Project
 
-Our project is called "god" (as in "the god of this virtual world we're creating"). It's already set up with the basic structure:
+Our project is called "god" (as in "the god of this virtual world we're creating"). It's already set up with the basic structure.
+
+**Inside the Lima VM:**
 
 ```bash
-# Clone the repo (or you already have it)
-cd /path/to/veleiro-god
+# The project is mounted at ~/workplace/veleiro-god
+cd ~/workplace/veleiro-god
 
-# Install dependencies (we use uv for package management)
-uv sync
+# Use the god alias (handles sudo and venv automatically)
+god --version
 
-# Run the CLI to verify it works
-uv run god --version
+# Or explicitly with sudo (required for KVM access)
+sudo uv run god --version
 ```
+
+**Why sudo?** KVM requires root access. The Lima VM is configured so that:
+- `uv` is installed system-wide (available to both user and root)
+- The Python venv lives at `/opt/god/venv` (inside the VM, not on the mounted filesystem)
+- The `UV_PROJECT_ENVIRONMENT` variable is preserved when using `sudo`
+
+This setup means you can seamlessly run `sudo uv run god ...` and it uses the correct virtual environment.
 
 The project structure we'll build:
 
 ```
 veleiro-god/
+├── lima/
+│   └── god.yaml            # Lima VM configuration (start here!)
 ├── src/god/
 │   ├── __init__.py
 │   ├── cli.py              # Command-line interface
