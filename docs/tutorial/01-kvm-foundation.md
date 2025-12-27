@@ -266,6 +266,8 @@ def get_errno():
     return lib.__errno_location()[0]
 ```
 
+**Important Note About cffi and Varargs:** Notice that ioctl is declared with `...` (varargs) for the third parameter. When calling ioctl through cffi, you must always provide an explicit third argument, even for ioctls that don't need data. If you call `lib.ioctl(fd, request)` without a third argument, cffi doesn't know how to handle the varargs and will pass garbage data, resulting in `EINVAL` (errno 22) errors. For ioctls that don't need data, pass `ffi.cast("int", 0)`.
+
 ### The ioctl Request Codes
 
 KVM defines many ioctl request codes. These are magic numbers that tell KVM what operation to perform. They're defined as C macros in the Linux headers, but we need to translate them to Python constants.
@@ -498,19 +500,19 @@ This module handles opening /dev/kvm and performing system-level queries
 like checking the API version and supported capabilities.
 """
 
-import os
-from .bindings import ffi, lib, get_errno
+from .bindings import ffi, get_errno, lib
 from .constants import (
-    KVM_GET_API_VERSION,
     KVM_CHECK_EXTENSION,
+    KVM_GET_API_VERSION,
     KVM_GET_VCPU_MMAP_SIZE,
-    O_RDWR,
     O_CLOEXEC,
+    O_RDWR,
 )
 
 
 class KVMError(Exception):
     """Exception raised when a KVM operation fails."""
+
     pass
 
 
@@ -566,7 +568,9 @@ class KVMSystem:
                 raise KVMError(f"Failed to open {device_path}: errno {errno}")
 
         # Check API version
-        self._api_version = lib.ioctl(self._fd, KVM_GET_API_VERSION)
+        # Note: cffi varargs require an explicit third argument, even for ioctls
+        # that don't need data. We pass 0 cast to int.
+        self._api_version = lib.ioctl(self._fd, KVM_GET_API_VERSION, ffi.cast("int", 0))
         if self._api_version < 0:
             self.close()
             raise KVMError(f"Failed to get KVM API version: errno {get_errno()}")
@@ -625,7 +629,8 @@ class KVMSystem:
             The capability value. 0 means not supported, >0 means supported
             (the exact value may have meaning depending on the capability).
         """
-        result = lib.ioctl(self._fd, KVM_CHECK_EXTENSION, ffi.cast("unsigned long", capability))
+        # The capability number is passed as the third argument to the ioctl
+        result = lib.ioctl(self._fd, KVM_CHECK_EXTENSION, ffi.cast("int", capability))
         if result < 0:
             # Some capabilities return -1 for "not supported" instead of 0
             return 0
@@ -641,7 +646,7 @@ class KVMSystem:
         Returns:
             Size in bytes.
         """
-        size = lib.ioctl(self._fd, KVM_GET_VCPU_MMAP_SIZE)
+        size = lib.ioctl(self._fd, KVM_GET_VCPU_MMAP_SIZE, ffi.cast("int", 0))
         if size < 0:
             raise KVMError(f"Failed to get vCPU mmap size: errno {get_errno()}")
         return size
@@ -660,7 +665,6 @@ human-readable descriptions of each.
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 from .system import KVMSystem
 
@@ -676,10 +680,11 @@ class Capability:
         description: Human-readable description of what this capability does
         value: The value returned by KVM (None if not queried yet)
     """
+
     name: str
     number: int
     description: str
-    value: Optional[int] = None
+    value: int | None = None
 
 
 # All capabilities we care about, with descriptions
@@ -807,34 +812,33 @@ Command-line interface for the god VMM.
 This module defines all CLI commands using the Typer library.
 """
 
+from typing import Annotated
+
 import typer
 
 from god import __version__
 
 app = typer.Typer(
+    name="god",
     help="god - A Virtual Machine Monitor built from scratch",
     no_args_is_help=True,
 )
 
 
-def version_callback(value: bool):
+def version_callback(value: bool) -> None:
     """Show version and exit."""
     if value:
-        print(f"god version {__version__}")
+        typer.echo(f"god {__version__}")
         raise typer.Exit()
 
 
 @app.callback()
 def main(
-    version: bool = typer.Option(
-        False,
-        "--version",
-        "-v",
-        callback=version_callback,
-        is_eager=True,
-        help="Show version and exit.",
-    ),
-):
+    version: Annotated[
+        bool | None,
+        typer.Option("--version", "-v", callback=version_callback, is_eager=True),
+    ] = None,
+) -> None:
     """god - A Virtual Machine Monitor built from scratch."""
     pass
 
@@ -845,7 +849,7 @@ app.add_typer(kvm_app, name="kvm")
 
 
 @kvm_app.command("info")
-def kvm_info():
+def kvm_info() -> None:
     """
     Display KVM system information.
 
@@ -853,15 +857,15 @@ def kvm_info():
     This is useful for verifying that KVM is working correctly and understanding
     what features are available on this system.
     """
-    from god.kvm.system import KVMSystem, KVMError
-    from god.kvm.capabilities import query_capabilities, format_capabilities
+    from god.kvm.capabilities import format_capabilities, query_capabilities
+    from god.kvm.system import KVMError, KVMSystem
 
     try:
         with KVMSystem() as kvm:
             print("KVM System Information")
             print("=" * 60)
             print()
-            print(f"Device:            /dev/kvm")
+            print("Device:            /dev/kvm")
             print(f"API Version:       {kvm.api_version} (expected: 12)")
             print(f"vCPU mmap size:    {kvm.get_vcpu_mmap_size()} bytes")
             print()
@@ -874,7 +878,11 @@ def kvm_info():
 
     except KVMError as e:
         print(f"Error: {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
+
+
+if __name__ == "__main__":
+    app()
 ```
 
 ### Creating the Package Structure
@@ -957,6 +965,8 @@ Capabilities:
 
 KVM is ready!
 ```
+
+The exact values will vary depending on your system. For example, on some systems you might see `KVM_CAP_NR_MEMSLOTS = 32767` instead of `32`, or `KVM_CAP_ARM_EL1_32BIT = 1` if your CPU supports 32-bit guests. The important things are that the API version is 12 and you see "KVM is ready!" at the end.
 
 ### Troubleshooting Common Issues
 
