@@ -125,55 +125,76 @@ kvm_run = mmap(
     addr=None,
     length=mmap_size,
     prot=PROT_READ | PROT_WRITE,
-    flags=MAP_SHARED,  # Note: SHARED, not PRIVATE
+    flags=MAP_SHARED,  # Important: SHARED, not PRIVATE
     fd=vcpu_fd,
     offset=0,
 )
 ```
 
-Note we use `MAP_SHARED` because this memory is shared with the kernel.
+We use `MAP_SHARED` because both the kernel and our VMM need to see each other's writes to this memory. When KVM runs the guest and it exits, the kernel writes the `exit_reason` to this structure. With `MAP_PRIVATE`, we'd get our own copy of the memory and never see the kernel's updates.
+
+This is different from guest RAM which uses `MAP_PRIVATE`. For guest RAM, the kernel maps our memory into the guest's address space, but we don't need to see real-time updates from the kernel—we just need to provide the backing memory. The kernel reads/writes through the guest's page tables, not through our mapping.
 
 ### ARM64 vCPU Initialization
 
-On ARM64, we need to initialize the vCPU with a specific target configuration before we can use it. This is done with:
+On ARM64, we need to initialize the vCPU with a specific target configuration before we can use it. This is a two-step process:
 
 ```python
-# Get the preferred target for this host
-vcpu_init = ioctl(kvm_fd, KVM_ARM_PREFERRED_TARGET, &init_struct)
+# First, allocate a kvm_vcpu_init structure
+init = ffi.new("struct kvm_vcpu_init *")
 
-# Initialize the vCPU with that target
-ioctl(vcpu_fd, KVM_ARM_VCPU_INIT, &init_struct)
+# Ask KVM what CPU target to use for this host
+# This call is made on the VM fd (not /dev/kvm or the vCPU fd)
+result = ioctl(vm_fd, KVM_ARM_PREFERRED_TARGET, init)
+
+# KVM has now filled in init.target with the appropriate value
+# On most modern ARM64 systems, this will be KVM_ARM_TARGET_GENERIC_V8
+
+# Enable PSCI 0.2 support - this is critical!
+# PSCI (Power State Coordination Interface) allows the guest to
+# request system shutdown/reset via HVC calls
+KVM_ARM_VCPU_PSCI_0_2 = 2  # Feature bit index
+init.features[0] |= (1 << KVM_ARM_VCPU_PSCI_0_2)
+
+# Now initialize the vCPU with this configuration
+result = ioctl(vcpu_fd, KVM_ARM_VCPU_INIT, init)
 ```
 
-This tells KVM what kind of CPU to emulate (Cortex-A53, Cortex-A72, etc.).
+The `kvm_vcpu_init` structure has two fields:
+- `target`: The CPU type (e.g., `KVM_ARM_TARGET_GENERIC_V8`). KVM fills this in based on your host hardware.
+- `features[7]`: A bitmask of features to enable. We must enable `KVM_ARM_VCPU_PSCI_0_2` (bit 2) to allow the guest to shut down properly.
+
+Without PSCI enabled, the guest has no clean way to exit—it would have to rely on MMIO or other hacks.
 
 ## The kvm_run Structure
 
-Let's look at the kvm_run structure that we share with the kernel. Add this to our bindings:
+Let's look at the kvm_run structure that we share with the kernel. Understanding its layout is important because we'll read from it directly using pointer arithmetic:
 
 ```c
 struct kvm_run {
-    /* in */
-    __u8 request_interrupt_window;
-    __u8 immediate_exit;
-    __u8 padding1[6];
+    /* in (offset 0-7) */
+    __u8 request_interrupt_window;  // offset 0
+    __u8 immediate_exit;            // offset 1
+    __u8 padding1[6];               // offset 2-7
 
-    /* out */
-    __u32 exit_reason;
+    /* out (offset 8-15) */
+    __u32 exit_reason;              // offset 8 (we read this!)
     __u8 ready_for_interrupt_injection;
     __u8 if_flag;
     __u16 flags;
 
-    /* ... more fields ... */
+    /* in/out (offset 16-31) */
+    __u64 cr8;                      // offset 16
+    __u64 apic_base;                // offset 24
 
-    /* Exit-specific data */
+    /* Exit-specific data (offset 32+) */
     union {
-        /* KVM_EXIT_MMIO */
+        /* KVM_EXIT_MMIO (at offset 32) */
         struct {
-            __u64 phys_addr;
-            __u8  data[8];
-            __u32 len;
-            __u8  is_write;
+            __u64 phys_addr;   // +0  (offset 32)
+            __u8  data[8];     // +8  (offset 40)
+            __u32 len;         // +16 (offset 48)
+            __u8  is_write;    // +20 (offset 52)
         } mmio;
 
         /* KVM_EXIT_HYPERCALL */
@@ -191,8 +212,10 @@ struct kvm_run {
 ```
 
 The key fields are:
-- `exit_reason`: Why the guest stopped (KVM_EXIT_HLT, KVM_EXIT_MMIO, etc.)
-- The union: Exit-specific data depending on the exit reason
+- `exit_reason` at offset 8: Why the guest stopped (KVM_EXIT_HLT, KVM_EXIT_MMIO, etc.)
+- The exit union at offset 32: Exit-specific data depending on the exit reason
+
+We don't define this structure in our cffi bindings because the exact layout varies by architecture. Instead, we access fields directly using pointer offsets.
 
 ## The Run Loop - Heart of the VMM
 
@@ -238,15 +261,31 @@ while True:
 
 ### Exit Reasons We Care About
 
-**KVM_EXIT_HLT (5)**: The guest executed a HLT (halt) instruction. On ARM64, this is the `WFI` or `HLT` instruction. Often used to wait for interrupts or signal "I'm done."
-
 **KVM_EXIT_MMIO (6)**: The guest tried to read from or write to a memory address that isn't RAM—it's a device address. We need to emulate the device access.
 
-**KVM_EXIT_SYSTEM_EVENT (24)**: The guest requested a system event like shutdown or reset (usually through PSCI on ARM).
+**KVM_EXIT_SYSTEM_EVENT (24)**: The guest requested a system event like shutdown or reset through PSCI. **This is how we'll halt our guest on ARM64.**
 
 **KVM_EXIT_INTERNAL_ERROR (17)**: KVM encountered an internal error. This usually means we set something up wrong.
 
 **KVM_EXIT_FAIL_ENTRY (9)**: The CPU failed to enter guest mode. Usually indicates incorrect vCPU state.
+
+### Why Not WFI or HLT?
+
+You might expect to use the `WFI` (Wait For Interrupt) or `HLT` instruction to halt the guest. However:
+
+- **WFI** on ARM64 KVM does **not** cause a VM exit. It just puts the vCPU to sleep waiting for an interrupt that never comes (since we haven't set up an interrupt controller). Your VMM would hang forever.
+
+- **HLT** on ARM64 is a debug halt instruction that triggers a Debug exception, not a VM exit.
+
+Instead, ARM64 guests use **PSCI (Power State Coordination Interface)** to request shutdown:
+
+```asm
+mov     x0, #0x0008             /* PSCI_SYSTEM_OFF lower bits */
+movk    x0, #0x8400, lsl #16    /* x0 = 0x84000008 */
+hvc     #0                       /* Call hypervisor */
+```
+
+The `HVC` (Hypervisor Call) instruction traps to KVM, which recognizes the PSCI SYSTEM_OFF function ID and returns `KVM_EXIT_SYSTEM_EVENT` to our VMM.
 
 ## Setting Registers
 
@@ -473,7 +512,8 @@ class VCPU:
         self._closed = False
 
         # Create the vCPU
-        self._fd = lib.ioctl(vm_fd, KVM_CREATE_VCPU, vcpu_id)
+        # Note: vcpu_id must be cast to int for cffi's variadic ioctl
+        self._fd = lib.ioctl(vm_fd, KVM_CREATE_VCPU, ffi.cast("int", vcpu_id))
         if self._fd < 0:
             raise VCPUError(f"Failed to create vCPU {vcpu_id}: errno {get_errno()}")
 
@@ -503,13 +543,19 @@ class VCPU:
     def _init_arm64(self):
         """Initialize the vCPU with ARM64-specific settings."""
         # Get the preferred target for this host
+        # Note: This ioctl is called on the VM fd, not /dev/kvm
         init = ffi.new("struct kvm_vcpu_init *")
 
-        result = lib.ioctl(self._kvm.fd, KVM_ARM_PREFERRED_TARGET, init)
+        result = lib.ioctl(self._vm_fd, KVM_ARM_PREFERRED_TARGET, init)
         if result < 0:
             raise VCPUError(
                 f"Failed to get preferred target: errno {get_errno()}"
             )
+
+        # Enable PSCI 0.2 support
+        # This allows the guest to request shutdown via HVC calls
+        KVM_ARM_VCPU_PSCI_0_2 = 2
+        init.features[0] |= (1 << KVM_ARM_VCPU_PSCI_0_2)
 
         # Initialize the vCPU with that target
         result = lib.ioctl(self._fd, KVM_ARM_VCPU_INIT, init)
@@ -605,7 +651,8 @@ class VCPU:
         Returns:
             The exit reason (KVM_EXIT_*).
         """
-        result = lib.ioctl(self._fd, KVM_RUN, 0)
+        # Note: We must cast the 0 to int for cffi's variadic ioctl
+        result = lib.ioctl(self._fd, KVM_RUN, ffi.cast("int", 0))
         if result < 0:
             errno = get_errno()
             # EINTR (4) is expected if we received a signal
@@ -632,13 +679,13 @@ class VCPU:
         Returns:
             Tuple of (phys_addr, data, length, is_write)
         """
-        # MMIO data is in the union at offset 16 in kvm_run
-        # struct layout:
-        #   offset 16: __u64 phys_addr
-        #   offset 24: __u8 data[8]
-        #   offset 32: __u32 len
-        #   offset 36: __u8 is_write
-        mmio_base = self._kvm_run + 16
+        # The exit union starts at offset 32 in kvm_run
+        # MMIO struct layout:
+        #   offset 32 (+0):  __u64 phys_addr
+        #   offset 40 (+8):  __u8 data[8]
+        #   offset 48 (+16): __u32 len
+        #   offset 52 (+20): __u8 is_write
+        mmio_base = self._kvm_run + 32
 
         phys_addr = ffi.cast("uint64_t *", mmio_base)[0]
         data = bytes(ffi.cast("uint8_t *", mmio_base + 8)[i] for i in range(8))
@@ -653,7 +700,8 @@ class VCPU:
 
         Call this before run() after handling an MMIO read.
         """
-        mmio_data_ptr = ffi.cast("uint8_t *", self._kvm_run + 16 + 8)
+        # data field is at offset 32 + 8 = 40
+        mmio_data_ptr = ffi.cast("uint8_t *", self._kvm_run + 32 + 8)
         for i, byte in enumerate(data[:8]):
             mmio_data_ptr[i] = byte
 
@@ -718,7 +766,7 @@ __all__ = ["VCPU", "VCPUError", "registers"]
 
 Now let's create a simple guest program to test our vCPU. This will be ARM64 assembly that:
 1. Writes a value to a memory location
-2. Executes HLT to stop
+2. Requests shutdown via PSCI
 
 ### The Assembly Code
 
@@ -732,7 +780,7 @@ Create `tests/guest_code/simple.S`:
  * 1. Loads the value 0xDEADBEEF into x0
  * 2. Loads an address into x1
  * 3. Stores x0 at that address
- * 4. Halts
+ * 4. Requests shutdown via PSCI
  *
  * After this runs, we can verify that 0xDEADBEEF was written to memory.
  */
@@ -741,9 +789,11 @@ Create `tests/guest_code/simple.S`:
 
 _start:
     /* Load 0xDEADBEEF into x0 */
-    /* We have to build it in pieces because ARM immediates are limited */
-    mov     x0, #0xBEEF         /* x0 = 0x000000000000BEEF */
-    movk    x0, #0xDEAD, lsl #16 /* x0 = 0x00000000DEADBEEF */
+    /* ARM64 can't load large immediates in one instruction, so we use
+     * mov to load the lower 16 bits, then movk (move keep) to load
+     * the upper bits without clearing what we already set */
+    mov     x0, #0xBEEF             /* x0 = 0x000000000000BEEF */
+    movk    x0, #0xDEAD, lsl #16    /* x0 = 0x00000000DEADBEEF */
 
     /* Load address 0x40001000 into x1 */
     /* This is in our RAM region (RAM starts at 0x40000000) */
@@ -753,18 +803,26 @@ _start:
     /* Store x0 at the address in x1 */
     str     x0, [x1]
 
-    /* Halt - this will cause a VM exit with KVM_EXIT_HLT */
-    hlt     #0
+    /*
+     * Shutdown using PSCI
+     *
+     * PSCI (Power State Coordination Interface) is the standard way
+     * for ARM guests to request power state changes from the hypervisor.
+     *
+     * PSCI_SYSTEM_OFF = 0x84000008 (32-bit calling convention)
+     * We put this in x0 and execute HVC #0 (hypervisor call)
+     */
+    mov     x0, #0x0008             /* Lower bits of PSCI_SYSTEM_OFF */
+    movk    x0, #0x8400, lsl #16    /* x0 = 0x84000008 */
+    hvc     #0                       /* Call hypervisor - exits VM */
 
     /* Should never reach here */
     b       .
 ```
 
-### Cross-Compiling
+### Building the Guest Program
 
-Since we're on macOS but targeting ARM64 Linux, we need to cross-compile inside the Lima VM.
-
-Inside Lima:
+Inside the Lima VM, use the ARM64 build tools to assemble and link:
 
 ```bash
 # Create the directory
@@ -778,18 +836,32 @@ aarch64-linux-gnu-as -o tests/guest_code/simple.o tests/guest_code/simple.S
 aarch64-linux-gnu-ld -nostdlib -static -Ttext=0x40080000 \
     -o tests/guest_code/simple tests/guest_code/simple.o
 
-# Extract just the code section
+# Extract just the raw binary (no ELF headers)
 aarch64-linux-gnu-objcopy -O binary tests/guest_code/simple tests/guest_code/simple.bin
 ```
 
-Wait, we don't have these tools installed yet. Let's install them in Lima:
+Let's verify the disassembly looks right:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+$ aarch64-linux-gnu-objdump -d tests/guest_code/simple
+
+tests/guest_code/simple:     file format elf64-littleaarch64
+
+Disassembly of section .text:
+
+0000000040080000 <_start>:
+    40080000:   d297dde0    mov     x0, #0xbeef
+    40080004:   f2bbd5a0    movk    x0, #0xdead, lsl #16
+    40080008:   d2820001    mov     x1, #0x1000
+    4008000c:   f2a80001    movk    x1, #0x4000, lsl #16
+    40080010:   f9000020    str     x0, [x1]
+    40080014:   d2800100    mov     x0, #0x8
+    40080018:   f2b08000    movk    x0, #0x8400, lsl #16
+    4008001c:   d4000002    hvc     #0x0
+    40080020:   14000000    b       40080020 <_start+0x20>
 ```
 
-Now we can assemble and create the binary.
+Perfect! 9 instructions × 4 bytes = 36 bytes.
 
 ## Implementation: The Run Loop
 
@@ -1058,32 +1130,16 @@ Now let's test everything!
 Inside Lima:
 
 ```bash
-cd /path/to/workspace/veleiro-god
+cd ~/workplace/veleiro-god
 
-# First, create and assemble our test program
-mkdir -p tests/guest_code
-
-cat > tests/guest_code/simple.S << 'EOF'
-    .global _start
-
-_start:
-    mov     x0, #0xBEEF
-    movk    x0, #0xDEAD, lsl #16
-    mov     x1, #0x1000
-    movk    x1, #0x4000, lsl #16
-    str     x0, [x1]
-    hlt     #0
-    b       .
-EOF
-
-# Assemble and link
+# Build the test program
 aarch64-linux-gnu-as -o tests/guest_code/simple.o tests/guest_code/simple.S
 aarch64-linux-gnu-ld -nostdlib -static -Ttext=0x40080000 \
     -o tests/guest_code/simple tests/guest_code/simple.o
 aarch64-linux-gnu-objcopy -O binary tests/guest_code/simple tests/guest_code/simple.bin
 
 # Run it!
-uv run god run tests/guest_code/simple.bin
+god run tests/guest_code/simple.bin
 ```
 
 Expected output:
@@ -1094,22 +1150,24 @@ VM created: fd=4
 vCPU created: fd=5
 
 Initial register state:
-  PC = 0x0000000040080000
-  SP = 0x0000000044000000
+  PC     = 0x0000000040080000
+  SP     = 0x0000000044000000
   PSTATE = 0x00000000000001c5
 
 Loading tests/guest_code/simple.bin...
-Loaded 24 bytes at 0x40080000
+Loaded 36 bytes at 0x40080000
+
 Running...
 ------------------------------------------------------------
+Guest requested shutdown/reset
 ------------------------------------------------------------
 
 Execution finished!
   Total exits: 1
-  Exit reason: HLT
-  Guest halted: True
+  Exit reason: SYSTEM_EVENT
+  Guest halted: False
   Exit breakdown:
-    HLT: 1
+    SYSTEM_EVENT: 1
 
 Memory at 0x40001000: 0x00000000deadbeef
 SUCCESS! Guest wrote expected value.
@@ -1172,7 +1230,30 @@ This is appropriate for bare-metal code or kernel code. User programs would run 
 
 ### vCPU Initialization
 
-On ARM64, you **must** call `KVM_ARM_VCPU_INIT` before running the vCPU. If you forget, you'll get errors or undefined behavior.
+On ARM64, you **must** call `KVM_ARM_VCPU_INIT` before running the vCPU. If you forget, you'll get errors or undefined behavior. Also:
+- Enable `KVM_ARM_VCPU_PSCI_0_2` in the features, or the guest won't be able to shut down cleanly.
+- `KVM_ARM_PREFERRED_TARGET` is called on the **VM fd**, not `/dev/kvm`.
+
+### cffi Variadic Arguments
+
+When using cffi to call variadic functions like `ioctl()`, you must cast integer arguments to cdata types:
+
+```python
+# Wrong - causes "needs to be a cdata object" error
+lib.ioctl(fd, KVM_RUN, 0)
+
+# Correct
+lib.ioctl(fd, KVM_RUN, ffi.cast("int", 0))
+```
+
+### kvm_run Structure Offsets
+
+The exit-specific data in `kvm_run` starts at offset **32**, not 16. The first 32 bytes contain:
+- Bytes 0-7: Input fields
+- Bytes 8-15: Exit reason and flags
+- Bytes 16-31: cr8 and apic_base
+
+If you get the offset wrong, you'll read garbage from the MMIO fields.
 
 ### Register Encoding
 
@@ -1185,6 +1266,14 @@ PSTATE has specific valid combinations. Invalid values cause entry failures. Alw
 ### Memory Must Be Mapped
 
 If the PC points to an address that isn't in a memory region, the guest will fail immediately. Make sure your entry point is in mapped memory.
+
+### WFI/HLT Don't Exit
+
+On ARM64 KVM:
+- `WFI` (Wait For Interrupt) does **not** cause a VM exit. The guest just sleeps forever waiting for an interrupt.
+- `HLT` is a debug halt, not a VM exit.
+
+Use PSCI SYSTEM_OFF via `hvc #0` to exit cleanly.
 
 ## What's Next?
 

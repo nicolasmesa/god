@@ -52,6 +52,8 @@ provision:
     curl -LsSf https://astral.sh/uv/install.sh | sh
     ln -sf /root/.local/bin/uv /usr/local/bin/uv
     ln -sf /root/.local/bin/uvx /usr/local/bin/uvx
+    # Install ARM64 build tools for guest code
+    apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
     # Create directory for VM-local venv (owned by lima user)
     mkdir -p /opt/god
     chown "${LIMA_CIDATA_USER}:${LIMA_CIDATA_USER}" /opt/god
@@ -93,6 +95,7 @@ message: |
   - Docker (rootless)
   - uv (Python package manager) - venv at /opt/god/venv
   - Claude Code
+  - ARM64 build tools (aarch64-linux-gnu-as, aarch64-linux-gnu-ld, etc.)
 
   Mounted directories:
   - ~/workplace/veleiro-god (writable)

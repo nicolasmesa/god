@@ -127,11 +127,12 @@ KVM_SET_ONE_REG = _IOW(KVMIO, 0xAC, 16)
 
 # Initialize the vCPU with a specific configuration.
 # Required on ARM before first run.
-KVM_ARM_VCPU_INIT = _IOW(KVMIO, 0xAE, 8)  # 8 = sizeof(struct kvm_vcpu_init)
+# struct kvm_vcpu_init has target (4 bytes) + features[7] (28 bytes) = 32 bytes
+KVM_ARM_VCPU_INIT = _IOW(KVMIO, 0xAE, 32)
 
 # Get the preferred target CPU type for this host.
 # Returns the configuration to use with KVM_ARM_VCPU_INIT.
-KVM_ARM_PREFERRED_TARGET = _IOR(KVMIO, 0xAF, 8)
+KVM_ARM_PREFERRED_TARGET = _IOR(KVMIO, 0xAF, 32)
 
 
 # ============================================================================

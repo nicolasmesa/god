@@ -132,5 +132,118 @@ def test_vm(
         raise typer.Exit(code=1)
 
 
+@app.command("run")
+def run_binary(
+    binary: str = typer.Argument(..., help="Path to the binary to run"),
+    entry: str = typer.Option(
+        "0x40080000",
+        "--entry",
+        "-e",
+        help="Entry point address (hex)",
+    ),
+    ram_mb: int = typer.Option(
+        64,
+        "--ram",
+        "-r",
+        help="RAM size in megabytes",
+    ),
+):
+    """
+    Run a binary in the VM.
+
+    Loads the binary at the entry point address and runs until it halts.
+
+    Example:
+        god run tests/guest_code/simple.bin
+        god run my_kernel.bin --entry 0x40000000 --ram 128
+    """
+    from god.kvm.system import KVMSystem, KVMError
+    from god.vm.vm import VirtualMachine, VMError
+    from god.vcpu.runner import VMRunner, RunnerError
+    from god.vcpu import registers
+
+    # Parse entry point (support hex with 0x prefix or decimal)
+    entry_point = int(entry, 16) if entry.startswith("0x") else int(entry)
+
+    ram_bytes = ram_mb * 1024 * 1024
+
+    print(f"Creating VM with {ram_mb} MB RAM...")
+
+    try:
+        with KVMSystem() as kvm:
+            with VirtualMachine(kvm, ram_size=ram_bytes) as vm:
+                print(f"VM created: fd={vm.fd}")
+
+                runner = VMRunner(vm, kvm)
+                vcpu = runner.create_vcpu()
+                print(f"vCPU created: fd={vcpu.fd}")
+
+                # Set initial register state
+                # PC = entry point (where code starts)
+                vcpu.set_pc(entry_point)
+
+                # SP = top of RAM (stack grows down)
+                stack_top = vm.ram_base + vm.ram_size
+                vcpu.set_sp(stack_top)
+
+                # PSTATE = EL1h with all interrupts masked
+                # EL1h means: Exception Level 1, using SP_EL1
+                # This is "kernel mode" on ARM64
+                pstate = (
+                    registers.PSTATE_MODE_EL1H |  # Exception Level 1, SP_EL1
+                    registers.PSTATE_A |           # Mask async aborts
+                    registers.PSTATE_I |           # Mask IRQs
+                    registers.PSTATE_F             # Mask FIQs
+                )
+                vcpu.set_pstate(pstate)
+
+                print()
+                print("Initial register state:")
+                print(f"  PC     = 0x{entry_point:016x}")
+                print(f"  SP     = 0x{stack_top:016x}")
+                print(f"  PSTATE = 0x{pstate:016x}")
+                print()
+
+                # Load the binary
+                print(f"Loading {binary}...")
+                runner.load_binary(binary, entry_point)
+
+                # Run!
+                print()
+                print("Running...")
+                print("-" * 60)
+
+                stats = runner.run()
+
+                print("-" * 60)
+                print()
+                print("Execution finished!")
+                print(f"  Total exits: {stats['exits']}")
+                print(f"  Exit reason: {stats['exit_reason']}")
+                print(f"  Guest halted: {stats['hlt']}")
+
+                if stats["exit_counts"]:
+                    print("  Exit breakdown:")
+                    for reason, count in stats["exit_counts"].items():
+                        print(f"    {reason}: {count}")
+
+                # Check if our test value was written (for simple.bin test)
+                test_addr = 0x40001000
+                try:
+                    data = vm.memory.read(test_addr, 8)
+                    value = int.from_bytes(data, "little")
+                    print()
+                    print(f"Memory at 0x{test_addr:08x}: 0x{value:016x}")
+                    if value == 0xDEADBEEF:
+                        print("SUCCESS! Guest wrote expected value.")
+                except Exception:
+                    # Address might not be in RAM range - that's OK
+                    pass
+
+    except (KVMError, VMError, RunnerError) as e:
+        print(f"Error: {e}")
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()

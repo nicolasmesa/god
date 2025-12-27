@@ -49,6 +49,20 @@ ffi.cdef("""
         uint64_t memory_size;     // Size in bytes (must be page-aligned)
         uint64_t userspace_addr;  // Host Virtual Address (HVA) - where it really is
     };
+
+    // vCPU initialization structure for ARM64
+    // Used with KVM_ARM_PREFERRED_TARGET and KVM_ARM_VCPU_INIT
+    struct kvm_vcpu_init {
+        uint32_t target;       // CPU target type (e.g., generic ARM, Cortex-A53)
+        uint32_t features[7];  // Feature flags (e.g., enable PSCI, SVE, etc.)
+    };
+
+    // Single register access structure
+    // Used with KVM_GET_ONE_REG and KVM_SET_ONE_REG
+    struct kvm_one_reg {
+        uint64_t id;    // Register identifier (encodes type, size, and which register)
+        uint64_t addr;  // Pointer to value (cast from userspace address)
+    };
 """)
 
 # Compile the C interface
