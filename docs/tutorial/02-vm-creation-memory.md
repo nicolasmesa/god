@@ -86,6 +86,38 @@ From the guest's perspective, it has a physical address space starting at 0. It 
 
 But in reality, these are all virtual. The "RAM" is actually host memory that we allocate. The "serial port" is code in our VMM that handles reads/writes to that address.
 
+### How This Works on Real Hardware
+
+Before we continue with virtualization, it's worth understanding how memory-mapped I/O works on physical machines—the thing we're trying to emulate.
+
+On a real computer, the CPU doesn't treat device addresses differently from RAM. It just issues load/store instructions to addresses. The **system interconnect** (the bus or fabric connecting the CPU to everything else) examines the address and routes the transaction to the right destination:
+
+```
+        CPU
+         │
+         ▼
+┌─────────────────────┐
+│  Address Decoder /  │
+│    Interconnect     │
+└─────────────────────┘
+    │       │       │
+    ▼       ▼       ▼
+  DRAM    UART     GIC
+  (RAM)  (chip)   (chip)
+```
+
+When the CPU writes to address 0x09000000 (where the UART lives), the interconnect sees that address isn't in the DRAM range and routes the transaction to the UART chip instead. There's no actual "memory" at 0x09000000—there's a device that responds to that address.
+
+**Do devices steal RAM?** No. The physical address space is enormous—48-bit addressing gives you 256 TB of address space. Your 64 GB of RAM occupies a tiny fraction. Devices simply use different addresses in the same huge space. (On 32-bit systems, this *was* a real problem—with only 4 GB of address space, device mappings ate into usable RAM, which is why 32-bit Windows showed ~3.2 GB usable even with 4 GB installed.)
+
+GPUs are an interesting case: they have their own memory (VRAM) on the graphics card, but the CPU needs to access it sometimes. The GPU's VRAM gets mapped into the CPU's physical address space at some high address (via PCIe BAR registers), letting the CPU read/write GPU memory—but it's still physically separate chips.
+
+In our VMM, we're mimicking this hardware behavior:
+- **RAM addresses** → backed by real memory (we allocate it)
+- **Device addresses** → not backed by memory, so the access traps to our VMM, and we emulate the device
+
+The Stage-2 page tables act like the hardware's address decoder—they either translate to real memory or fault so we can handle it in software.
+
 ### Guest Physical Addresses (GPAs)
 
 When we talk about addresses in the guest, we use the term **Guest Physical Address (GPA)**. From the guest's point of view, these are physical addresses. From our point of view, they're virtual.
@@ -120,6 +152,12 @@ We don't worry about the final step (host page tables)—the host OS handles tha
 ### What is a Memory Slot?
 
 KVM uses **memory slots** to track guest memory regions. Each slot describes a contiguous region of guest physical memory and where it's backed in host memory.
+
+You'll see the terms "slot" and "region" used somewhat interchangeably in KVM documentation. The distinction is subtle:
+- **Region** refers to the memory area itself (its address, size, and properties)
+- **Slot** refers to KVM's bookkeeping mechanism—a numbered entry in a table
+
+Think of it like a parking garage: the "slot" is the numbered space (slot 0, slot 1, ...), and the "region" is the description of what's parked there. The structure is actually called `kvm_userspace_memory_region`, but it has a `slot` field to identify which slot to use. The slot number matters when you want to modify or remove a region later.
 
 A memory slot contains:
 - **Guest Physical Address (GPA)**: Where this memory appears in the guest
@@ -290,7 +328,7 @@ GIC_REDISTRIBUTOR = MemoryRegion(
 # We emulate ARM's PL011 UART for serial console output.
 # This is what "console=ttyAMA0" uses in the kernel command line.
 
-UART_BASE = MemoryRegion(
+UART = MemoryRegion(
     name="UART (PL011)",
     base=0x0900_0000,
     size=0x0000_1000,  # 4 KB
@@ -390,7 +428,7 @@ def print_layout():
     print(GIC_DISTRIBUTOR)
     print(GIC_REDISTRIBUTOR)
     print()
-    print(UART_BASE)
+    print(UART)
     print()
     for i in range(VIRTIO_COUNT):
         region = get_virtio_region(i)
@@ -408,6 +446,19 @@ if __name__ == "__main__":
 ## Implementation: Memory Allocation
 
 Now let's implement the memory allocation. We'll use `mmap` to allocate host memory, then register it with KVM.
+
+Before we dive into the code, note that we'll have two similar-sounding classes:
+
+- **`MemoryRegion`** (in `layout.py`): A design-time concept describing where things *should go* in the guest's address space. These are just constants—no memory is allocated.
+
+- **`MemorySlot`** (in `memory.py`): A runtime concept tracking memory we've actually allocated with `mmap` and registered with KVM.
+
+The key insight is that **not every MemoryRegion becomes a MemorySlot**. For example:
+- RAM at 0x40000000 → becomes a MemorySlot (we allocate real memory)
+- UART at 0x09000000 → no MemorySlot (we *emulate* it—when the guest accesses this address, KVM exits and we handle it in code)
+- GIC at 0x08000000 → no MemorySlot (KVM handles the interrupt controller in-kernel)
+
+So `MemoryRegion` is "here's the guest's map of the world" and `MemorySlot` is "here's actual memory we gave it."
 
 ### Using mmap
 
@@ -450,7 +501,7 @@ This module handles allocating host memory and registering it with KVM
 as guest physical memory regions.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from god.kvm.bindings import ffi, lib, get_errno

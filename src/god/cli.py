@@ -73,5 +73,64 @@ def kvm_info() -> None:
         raise typer.Exit(code=1) from e
 
 
+@app.command("test-vm")
+def test_vm(
+    ram_mb: int = typer.Option(
+        1024,
+        "--ram",
+        "-r",
+        help="RAM size in megabytes",
+    ),
+):
+    """
+    Test VM creation and memory setup.
+
+    Creates a VM, allocates memory, writes some data, reads it back,
+    and verifies everything works.
+    """
+    from god.kvm.system import KVMSystem, KVMError
+    from god.vm.vm import VirtualMachine, VMError
+    from god.vm.memory import MemoryError
+
+    ram_bytes = ram_mb * 1024 * 1024
+
+    print(f"Creating VM with {ram_mb} MB RAM...")
+    print()
+
+    try:
+        with KVMSystem() as kvm:
+            with VirtualMachine(kvm, ram_size=ram_bytes) as vm:
+                print(f"VM created: {vm}")
+                print()
+                print("Memory slots:")
+                for slot in vm.memory.slots:
+                    print(f"  {slot}")
+                print()
+
+                # Write some data to memory
+                test_address = vm.ram_base
+                test_data = b"Hello from the VMM!"
+
+                print(f"Writing test data to 0x{test_address:08x}...")
+                vm.memory.write(test_address, test_data)
+
+                # Read it back
+                print(f"Reading back from 0x{test_address:08x}...")
+                read_back = vm.memory.read(test_address, len(test_data))
+
+                if read_back == test_data:
+                    print(f"Success! Read: {read_back}")
+                else:
+                    print(f"MISMATCH! Wrote: {test_data}, Read: {read_back}")
+                    raise typer.Exit(code=1)
+
+                print()
+                print("VM test passed!")
+
+    except (KVMError, VMError, MemoryError) as e:
+        print(f"Error: {e}")
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()

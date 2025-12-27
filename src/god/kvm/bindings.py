@@ -39,6 +39,16 @@ ffi.cdef("""
 
     // Error handling
     int *__errno_location(void);
+
+    // Memory region structure for KVM_SET_USER_MEMORY_REGION
+    // This tells KVM how to map guest physical addresses to host memory.
+    struct kvm_userspace_memory_region {
+        uint32_t slot;            // Slot ID (0, 1, 2, ...) - identifies this region
+        uint32_t flags;           // Flags like KVM_MEM_READONLY
+        uint64_t guest_phys_addr; // Guest Physical Address (GPA) - where guest sees it
+        uint64_t memory_size;     // Size in bytes (must be page-aligned)
+        uint64_t userspace_addr;  // Host Virtual Address (HVA) - where it really is
+    };
 """)
 
 # Compile the C interface
