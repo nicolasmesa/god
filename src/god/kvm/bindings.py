@@ -63,6 +63,38 @@ ffi.cdef("""
         uint64_t id;    // Register identifier (encodes type, size, and which register)
         uint64_t addr;  // Pointer to value (cast from userspace address)
     };
+
+    // =========================================================================
+    // In-kernel device structures (GIC, etc.)
+    // =========================================================================
+
+    // Structure for creating an in-kernel device (KVM_CREATE_DEVICE)
+    // Used for devices that KVM emulates in kernel space for performance,
+    // like the interrupt controller (GIC).
+    struct kvm_create_device {
+        uint32_t type;   // Input: device type (e.g., KVM_DEV_TYPE_ARM_VGIC_V3)
+        uint32_t fd;     // Output: file descriptor for the created device
+        uint32_t flags;  // Input: creation flags (e.g., KVM_CREATE_DEVICE_TEST)
+    };
+
+    // Structure for getting/setting device attributes (KVM_SET_DEVICE_ATTR)
+    // This is a key-value interface for configuring in-kernel devices.
+    // Think of it as: device.set(group, attr, value_at_addr)
+    struct kvm_device_attr {
+        uint32_t flags;  // Flags (currently unused, set to 0)
+        uint32_t group;  // Attribute group (namespace), e.g., "addresses" or "control"
+        uint64_t attr;   // Specific attribute within the group
+        uint64_t addr;   // Pointer to the value (for set) or buffer (for get)
+    };
+
+    // Structure for injecting interrupts (KVM_IRQ_LINE)
+    // Used to assert or deassert interrupt lines to the guest.
+    struct kvm_irq_level {
+        // The irq field encodes both the interrupt number and type.
+        // For ARM GIC SPIs: just the interrupt number (32+)
+        uint32_t irq;
+        uint32_t level;  // 1 = assert (raise), 0 = deassert (lower)
+    };
 """)
 
 # Compile the C interface

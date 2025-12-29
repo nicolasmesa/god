@@ -106,7 +106,28 @@ KVM_CREATE_VCPU = _IO(KVMIO, 0x41)
 
 # Create an in-kernel device (like the interrupt controller).
 # Argument is a pointer to struct kvm_create_device.
-KVM_CREATE_DEVICE = _IOWR(KVMIO, 0xE0, 12)  # 12 = sizeof(struct)
+KVM_CREATE_DEVICE = _IOWR(KVMIO, 0xE0, 12)  # 12 = sizeof(struct kvm_create_device)
+
+# Inject an interrupt into the guest via the interrupt controller.
+# Argument is a pointer to struct kvm_irq_level.
+# For level-triggered interrupts, you must deassert when the condition clears.
+KVM_IRQ_LINE = _IOW(KVMIO, 0x61, 8)  # 8 = sizeof(struct kvm_irq_level)
+
+
+# ============================================================================
+# Device ioctls (on device file descriptor from KVM_CREATE_DEVICE)
+# ============================================================================
+
+# Set an attribute on an in-kernel device.
+# Used to configure devices like the GIC (set addresses, initialize, etc.)
+# Argument is a pointer to struct kvm_device_attr.
+KVM_SET_DEVICE_ATTR = _IOW(KVMIO, 0xE1, 24)  # 24 = sizeof(struct kvm_device_attr)
+
+# Get an attribute from an in-kernel device.
+KVM_GET_DEVICE_ATTR = _IOW(KVMIO, 0xE2, 24)
+
+# Check if a device attribute exists (without getting/setting it).
+KVM_HAS_DEVICE_ATTR = _IOW(KVMIO, 0xE3, 24)
 
 
 # ============================================================================
@@ -215,3 +236,69 @@ EXIT_REASON_NAMES = {
     KVM_EXIT_SYSTEM_EVENT: "SYSTEM_EVENT",
     KVM_EXIT_ARM_NISV: "ARM_NISV",
 }
+
+
+# ============================================================================
+# In-kernel Device Types (for KVM_CREATE_DEVICE)
+# ============================================================================
+# These identify which type of device to create.
+
+# ARM GICv2 - older interrupt controller, memory-mapped CPU interface
+KVM_DEV_TYPE_ARM_VGIC_V2 = 5
+
+# ARM GICv3 - modern interrupt controller, system register CPU interface
+# This is what we use for our VMM.
+KVM_DEV_TYPE_ARM_VGIC_V3 = 7
+
+
+# ============================================================================
+# GIC Device Attribute Groups (for KVM_SET_DEVICE_ATTR)
+# ============================================================================
+# These are the "namespaces" for GIC configuration.
+
+# Address configuration group - set where GIC components appear in memory
+KVM_DEV_ARM_VGIC_GRP_ADDR = 0
+
+# Distributor configuration group
+KVM_DEV_ARM_VGIC_GRP_DIST_REGS = 1
+
+# CPU interface configuration group (GICv2 only)
+KVM_DEV_ARM_VGIC_GRP_CPU_REGS = 2
+
+# Control group - initialization and other control operations
+KVM_DEV_ARM_VGIC_GRP_CTRL = 4
+
+# Redistributor configuration group (GICv3)
+KVM_DEV_ARM_VGIC_GRP_REDIST_REGS = 5
+
+
+# ============================================================================
+# GIC Address Types (for KVM_DEV_ARM_VGIC_GRP_ADDR)
+# ============================================================================
+# These specify which GIC component's address we're setting.
+
+# GICv2 addresses
+KVM_VGIC_V2_ADDR_TYPE_DIST = 0  # Distributor base address
+KVM_VGIC_V2_ADDR_TYPE_CPU = 1   # CPU interface base address
+
+# GICv3 addresses
+KVM_VGIC_V3_ADDR_TYPE_DIST = 2    # Distributor base address
+KVM_VGIC_V3_ADDR_TYPE_REDIST = 3  # Redistributor base address
+
+
+# ============================================================================
+# GIC Control Attributes (for KVM_DEV_ARM_VGIC_GRP_CTRL)
+# ============================================================================
+
+# Initialize the GIC after configuration is complete.
+# Must be called after setting addresses, before creating vCPUs.
+KVM_DEV_ARM_VGIC_CTRL_INIT = 0
+
+
+# ============================================================================
+# Device Creation Flags (for KVM_CREATE_DEVICE)
+# ============================================================================
+
+# Test if device creation would succeed without actually creating it.
+# Useful for checking hardware/kernel support.
+KVM_CREATE_DEVICE_TEST = 1

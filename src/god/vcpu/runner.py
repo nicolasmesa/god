@@ -23,7 +23,7 @@ from god.kvm.constants import (
 )
 from god.kvm.system import KVMSystem
 from god.vm.vm import VirtualMachine
-from god.devices import DeviceRegistry, MMIOAccess
+from god.devices import DeviceRegistry, MMIOAccess, GIC
 from .vcpu import VCPU
 from . import registers
 
@@ -38,22 +38,34 @@ class VMRunner:
     Runs a virtual machine.
 
     This class manages the run loop and coordinates between the VM,
-    vCPU, and device handlers.
+    vCPU, and device handlers. It also sets up the GIC (interrupt
+    controller) which is required for the guest to receive interrupts.
+
+    The initialization sequence is:
+    1. VMRunner() - creates the GIC (required before vCPUs)
+    2. create_vcpu() - creates vCPUs (can call multiple times)
+    3. run() - finalizes GIC and starts execution
+
+    The GIC must be created before vCPUs, but finalized after all vCPUs
+    exist. VMRunner handles this automatically.
 
     Usage:
-        runner = VMRunner(vm, kvm)
-        vcpu = runner.create_vcpu()
+        runner = VMRunner(vm, kvm)  # GIC created here
+        vcpu0 = runner.create_vcpu()
+        vcpu1 = runner.create_vcpu()  # Multi-vCPU supported
 
         # Set up initial state
-        vcpu.set_pc(entry_point)
-        vcpu.set_sp(stack_top)
-        vcpu.set_pstate(...)
+        vcpu0.set_pc(entry_point)
+        vcpu0.set_sp(stack_top)
 
         # Load code
         runner.load_binary("/path/to/binary", entry_point)
 
-        # Run!
+        # Run (GIC finalized automatically, then execution starts)
         stats = runner.run()
+
+        # Inject interrupts
+        runner.gic.inject_irq(33, level=True)
     """
 
     def __init__(
@@ -61,43 +73,64 @@ class VMRunner:
         vm: VirtualMachine,
         kvm: KVMSystem,
         devices: DeviceRegistry | None = None,
+        create_gic: bool = True,
     ):
         """
         Create a runner for a VM.
+
+        This sets up the VM infrastructure including the GIC (interrupt
+        controller). The GIC must exist before vCPUs can be created.
 
         Args:
             vm: The VirtualMachine to run.
             kvm: The KVMSystem instance.
             devices: Device registry for MMIO handling. If not provided,
                      a new empty registry is created.
+            create_gic: If True (default), create the GIC automatically.
+                        Set to False only if you want to manage the GIC
+                        yourself (rare).
         """
         self._vm = vm
         self._kvm = kvm
         self._devices = devices if devices is not None else DeviceRegistry()
-        self._vcpu: VCPU | None = None
+        self._vcpus: list[VCPU] = []
+        self._gic: GIC | None = None
+
+        # Create the GIC (interrupt controller)
+        # This must happen before any vCPUs are created.
+        if create_gic:
+            self._gic = GIC(self._vm.fd)
+            self._gic.create()
 
     @property
     def devices(self) -> DeviceRegistry:
         """Get the device registry."""
         return self._devices
 
+    @property
+    def gic(self) -> GIC | None:
+        """Get the GIC (interrupt controller)."""
+        return self._gic
+
+    @property
+    def vcpus(self) -> list[VCPU]:
+        """Get all created vCPUs."""
+        return self._vcpus
+
     def create_vcpu(self) -> VCPU:
         """
         Create and return a vCPU.
 
-        Currently we only support a single vCPU.
+        You can create multiple vCPUs by calling this method multiple times.
+        The GIC will be finalized when run() is called, after all vCPUs exist.
 
         Returns:
             The created VCPU.
-
-        Raises:
-            RunnerError: If a vCPU was already created.
         """
-        if self._vcpu is not None:
-            raise RunnerError("vCPU already created")
-
-        self._vcpu = VCPU(self._vm.fd, self._kvm, vcpu_id=0)
-        return self._vcpu
+        vcpu_id = len(self._vcpus)
+        vcpu = VCPU(self._vm.fd, self._kvm, vcpu_id=vcpu_id)
+        self._vcpus.append(vcpu)
+        return vcpu
 
     def load_binary(self, path: str, entry_point: int) -> int:
         """
@@ -155,6 +188,9 @@ class VMRunner:
         """
         Run the VM until it halts or hits max_exits.
 
+        The GIC is automatically finalized before the first vCPU runs.
+        This ensures all vCPUs are created before GIC finalization.
+
         The run loop:
         1. Call vcpu.run() - guest executes until something happens
         2. Check exit_reason to see what happened
@@ -178,8 +214,14 @@ class VMRunner:
         Raises:
             RunnerError: If no vCPU was created, or on fatal errors.
         """
-        if self._vcpu is None:
-            raise RunnerError("vCPU not created - call create_vcpu() first")
+        if not self._vcpus:
+            raise RunnerError("No vCPUs created - call create_vcpu() first")
+
+        # Finalize GIC before running
+        # This must happen after all vCPUs are created so the GIC
+        # can set up per-CPU redistributors for each one.
+        if self._gic is not None and not self._gic.finalized:
+            self._gic.finalize()
 
         stats = {
             "exits": 0,
@@ -188,7 +230,9 @@ class VMRunner:
             "exit_counts": {},
         }
 
-        vcpu = self._vcpu
+        # For now, we only run the first vCPU
+        # Multi-vCPU execution requires threading (future work)
+        vcpu = self._vcpus[0]
 
         for _ in range(max_exits):
             # Run the vCPU - this blocks until the guest exits

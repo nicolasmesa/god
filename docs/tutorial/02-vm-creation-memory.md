@@ -653,6 +653,8 @@ class MemoryManager:
             raise MemoryError(
                 f"Failed to register memory slot: errno {get_errno()}"
             )
+        # Note: 'region' goes out of scope here and cffi will free it
+        # automatically - see "cffi Memory Management" below
 
     def get_host_address(self, guest_address: int) -> Optional[int]:
         """
@@ -765,6 +767,53 @@ class MemoryManager:
         """Clean up when garbage collected."""
         self.cleanup()
 ```
+
+### cffi Memory Management
+
+You might have noticed something in `_register_slot()`:
+
+```python
+region = ffi.new("struct kvm_userspace_memory_region *")
+# ... fill in fields ...
+lib.ioctl(self._vm_fd, KVM_SET_USER_MEMORY_REGION, region)
+# Function returns - what happens to 'region'?
+```
+
+When you call `ffi.new()`, cffi allocates memory for the struct (similar to `malloc()` in C). But we never call `free()`! How does this work?
+
+**cffi uses Python's garbage collector.** The memory allocated by `ffi.new()` is wrapped in a Python object. When that object goes out of scope and has no more references, Python's GC eventually runs a destructor that frees the underlying memory.
+
+This is very convenient for short-lived allocations like ioctl parameters—we don't need to manually track and free them. The structs we create for ioctls are typically:
+1. Created
+2. Filled with data
+3. Passed to an ioctl
+4. Never needed again
+
+When the function returns, `region` goes out of scope, and the memory is automatically reclaimed.
+
+**When manual management matters:**
+
+For large or long-lived allocations, you might want explicit control. That's why we use `mmap()`/`munmap()` for guest RAM instead of letting cffi manage it:
+
+```python
+# Guest RAM - we manage this explicitly with mmap/munmap
+self._host_mem = lib.mmap(...)
+
+# Later, in cleanup():
+lib.munmap(self._host_mem, size)
+```
+
+The guest RAM is gigabytes in size and needs to live for the entire VM lifetime. We want precise control over when it's allocated and freed, not whenever the GC decides to run.
+
+**If you ever need to free cffi memory immediately** (rare, but useful for very large temporary allocations), cffi 1.12+ provides `ffi.release()`:
+
+```python
+huge_buffer = ffi.new("char[]", 100_000_000)  # 100 MB
+# ... use it ...
+ffi.release(huge_buffer)  # Free immediately, don't wait for GC
+```
+
+For our VMM, the automatic management is perfect for ioctl parameters, and we handle the big stuff (guest RAM) ourselves.
 
 ## Implementation: The VM Class
 
