@@ -23,6 +23,7 @@ from god.kvm.constants import (
 )
 from god.kvm.system import KVMSystem
 from god.vm.vm import VirtualMachine
+from god.devices import DeviceRegistry, MMIOAccess
 from .vcpu import VCPU
 from . import registers
 
@@ -55,17 +56,30 @@ class VMRunner:
         stats = runner.run()
     """
 
-    def __init__(self, vm: VirtualMachine, kvm: KVMSystem):
+    def __init__(
+        self,
+        vm: VirtualMachine,
+        kvm: KVMSystem,
+        devices: DeviceRegistry | None = None,
+    ):
         """
         Create a runner for a VM.
 
         Args:
             vm: The VirtualMachine to run.
             kvm: The KVMSystem instance.
+            devices: Device registry for MMIO handling. If not provided,
+                     a new empty registry is created.
         """
         self._vm = vm
         self._kvm = kvm
+        self._devices = devices if devices is not None else DeviceRegistry()
         self._vcpu: VCPU | None = None
+
+    @property
+    def devices(self) -> DeviceRegistry:
+        """Get the device registry."""
+        return self._devices
 
     def create_vcpu(self) -> VCPU:
         """
@@ -100,7 +114,44 @@ class VMRunner:
         print(f"Loaded {size} bytes at 0x{entry_point:08x}")
         return size
 
-    def run(self, max_exits: int = 1000) -> dict:
+    def _handle_mmio(self, vcpu: VCPU) -> bool:
+        """
+        Handle an MMIO exit by dispatching to the device registry.
+
+        Args:
+            vcpu: The vCPU that triggered the MMIO exit.
+
+        Returns:
+            True if the access was handled by a device, False otherwise.
+        """
+        # Get MMIO access details from the vCPU
+        phys_addr, data_bytes, length, is_write = vcpu.get_mmio_info()
+
+        # Convert bytes to int for the device
+        if is_write:
+            data = int.from_bytes(data_bytes, "little")
+        else:
+            data = 0
+
+        # Package the access for the device registry
+        access = MMIOAccess(
+            address=phys_addr,
+            size=length,
+            is_write=is_write,
+            data=data,
+        )
+
+        # Dispatch to the appropriate device
+        result = self._devices.handle_mmio(access)
+
+        # For reads, we need to return data to the guest
+        if not is_write:
+            result_bytes = result.data.to_bytes(length, "little")
+            vcpu.set_mmio_data(result_bytes)
+
+        return result.handled
+
+    def run(self, max_exits: int = 100000, quiet: bool = False) -> dict:
         """
         Run the VM until it halts or hits max_exits.
 
@@ -113,6 +164,9 @@ class VMRunner:
         Args:
             max_exits: Maximum number of VM exits before giving up.
                        This prevents infinite loops during development.
+                       Default is 100000 (enough for a full boot).
+            quiet: If True, suppress debug output for normal operations
+                   like MMIO. Errors are always printed.
 
         Returns:
             Dict with execution statistics:
@@ -161,46 +215,35 @@ class VMRunner:
 
             elif exit_reason == KVM_EXIT_MMIO:
                 # Guest tried to access memory that isn't RAM
-                # This is how devices are accessed - we need to emulate them
-                phys_addr, data, length, is_write = vcpu.get_mmio_info()
-
-                if is_write:
-                    print(
-                        f"MMIO write: addr=0x{phys_addr:08x} "
-                        f"data={data.hex()} len={length}"
-                    )
-                    # For now, just ignore writes
-                else:
-                    print(
-                        f"MMIO read: addr=0x{phys_addr:08x} len={length}"
-                    )
-                    # Return zeros for now - we don't have any devices yet
-                    vcpu.set_mmio_data(bytes(length))
+                # Dispatch to the device registry to handle it
+                self._handle_mmio(vcpu)
 
             elif exit_reason == KVM_EXIT_SYSTEM_EVENT:
                 # Guest requested shutdown or reset
                 # On ARM, this usually comes through PSCI (Power State
                 # Coordination Interface)
-                print("Guest requested shutdown/reset")
+                if not quiet:
+                    print("\n[Guest requested shutdown/reset]")
                 break
 
             elif exit_reason == KVM_EXIT_INTERNAL_ERROR:
                 # Something went wrong inside KVM
-                print("KVM internal error!")
+                print("\n[KVM internal error]")
                 vcpu.dump_registers()
                 raise RunnerError("KVM internal error")
 
             elif exit_reason == KVM_EXIT_FAIL_ENTRY:
                 # The CPU failed to enter guest mode
                 # Usually means we set up the vCPU state incorrectly
-                print("Failed to enter guest mode!")
+                print("\n[Failed to enter guest mode]")
                 vcpu.dump_registers()
                 raise RunnerError("Entry to guest mode failed")
 
             else:
                 # Unknown exit - print info and stop
-                print(f"Unhandled exit: {exit_name}")
-                vcpu.dump_registers()
+                if not quiet:
+                    print(f"\n[Unhandled exit: {exit_name}]")
+                    vcpu.dump_registers()
                 break
 
         return stats

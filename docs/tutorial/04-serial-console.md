@@ -24,6 +24,26 @@ Our guest currently has no way to communicate with the outside world. It can exe
 
 The Linux kernel uses serial ports for early boot messages (before graphics drivers load). The kernel command line option `console=ttyAMA0` tells Linux to use the PL011 UART.
 
+### What Does "ttyAMA0" Mean?
+
+The device name `ttyAMA0` breaks down as:
+
+| Part | Meaning |
+|------|---------|
+| `tty` | "Teletype" - historical Unix name for terminal devices |
+| `AMA` | "ARM AMBA" - ARM's Advanced Microcontroller Bus Architecture |
+| `0` | First device of this type |
+
+**AMBA** is ARM's standard bus for connecting peripherals. The PL011 UART is part of ARM's "PrimeCell" IP library, and all PrimeCell peripherals connect via the AMBA bus. So when Linux loads its `amba-pl011` driver, devices appear as `/dev/ttyAMA*`.
+
+You might also see other tty device names:
+
+| Name | Hardware |
+|------|----------|
+| `ttyS0` | PC-style serial port (8250/16550 UART) |
+| `ttyUSB0` | USB-to-serial adapter |
+| `ttyAMA0` | ARM PL011 UART (what we're implementing) |
+
 ## How MMIO Works
 
 ### Memory-Mapped I/O
@@ -384,7 +404,7 @@ Linux uses this for "console=ttyAMA0".
 import sys
 from typing import TextIO
 
-from god.vm.layout import UART_BASE
+from god.vm.layout import UART
 from .device import Device
 
 
@@ -395,6 +415,10 @@ class PL011UART(Device):
     This provides basic serial console functionality:
     - Writes to DR output characters to the host terminal
     - Reads from FR return status (transmit ready, receive empty)
+
+    The real PL011 has FIFOs, interrupts, DMA, and baud rate configuration.
+    We skip most of that complexity - our "transmission" is instant (we just
+    print to stdout), so we always report the transmit FIFO as empty.
 
     Usage:
         uart = PL011UART()
@@ -432,20 +456,21 @@ class PL011UART(Device):
     def __init__(
         self,
         output: TextIO = sys.stdout,
-        base_address: int = UART_BASE.base,
-        size: int = UART_BASE.size,
+        base_address: int | None = None,
+        size: int | None = None,
     ):
         """
         Create a PL011 UART.
 
         Args:
             output: Where to write output (default: stdout).
-            base_address: MMIO base address.
-            size: MMIO region size.
+                    You can pass a StringIO for testing.
+            base_address: MMIO base address. Defaults to layout.UART.base.
+            size: MMIO region size. Defaults to layout.UART.size.
         """
         self._output = output
-        self._base_address = base_address
-        self._size = size
+        self._base_address = base_address if base_address is not None else UART.base
+        self._size = size if size is not None else UART.size
 
         # Internal state
         self._cr = 0          # Control Register (UART disabled initially)
@@ -612,6 +637,7 @@ from god.kvm.constants import (
     KVM_EXIT_INTERNAL_ERROR,
     KVM_EXIT_FAIL_ENTRY,
 )
+from god.kvm.system import KVMSystem
 from god.vm.vm import VirtualMachine
 from god.devices import DeviceRegistry, MMIOAccess
 from .vcpu import VCPU
@@ -631,18 +657,24 @@ class VMRunner:
     vCPU, and device handlers.
     """
 
-    def __init__(self, vm: VirtualMachine, kvm, devices: DeviceRegistry | None = None):
+    def __init__(
+        self,
+        vm: VirtualMachine,
+        kvm: KVMSystem,
+        devices: DeviceRegistry | None = None,
+    ):
         """
         Create a runner for a VM.
 
         Args:
             vm: The VirtualMachine to run.
             kvm: The KVMSystem instance.
-            devices: Device registry for MMIO handling (optional).
+            devices: Device registry for MMIO handling. If not provided,
+                     a new empty registry is created.
         """
         self._vm = vm
         self._kvm = kvm
-        self._devices = devices or DeviceRegistry()
+        self._devices = devices if devices is not None else DeviceRegistry()
         self._vcpu: VCPU | None = None
 
     @property
@@ -658,16 +690,20 @@ class VMRunner:
         self._vcpu = VCPU(self._vm.fd, self._kvm, vcpu_id=0)
         return self._vcpu
 
-    def load_binary(self, path: str, entry_point: int):
+    def load_binary(self, path: str, entry_point: int) -> int:
         """
         Load a binary file into guest memory.
 
         Args:
             path: Path to the binary file.
             entry_point: Guest address where the binary should be loaded.
+
+        Returns:
+            Number of bytes loaded.
         """
         size = self._vm.memory.load_file(entry_point, path)
         print(f"Loaded {size} bytes at 0x{entry_point:08x}")
+        return size
 
     def _handle_mmio(self, vcpu: VCPU) -> bool:
         """
@@ -814,16 +850,45 @@ wait_tx_ready:
     b       print_loop
 
 done:
-    /* Halt */
-    hlt     #0
+    /*
+     * Shutdown using PSCI (Power State Coordination Interface).
+     *
+     * On ARM64 KVM, neither WFI nor HLT cause a proper VM exit:
+     * - WFI (Wait For Interrupt) just sleeps forever waiting for an
+     *   interrupt that never comes (we haven't set up the GIC yet)
+     * - HLT is a debug instruction that causes an exception, not a VM exit
+     *
+     * Instead, ARM64 guests use PSCI to request shutdown. PSCI is a firmware
+     * interface - we make a "hypervisor call" (HVC) with the PSCI function
+     * ID in x0.
+     *
+     * PSCI_SYSTEM_OFF = 0x84000008 (using 32-bit calling convention)
+     *
+     * When KVM sees this HVC, it returns KVM_EXIT_SYSTEM_EVENT to our VMM.
+     */
+    mov     x0, #0x0008             /* Lower 16 bits of PSCI_SYSTEM_OFF */
+    movk    x0, #0x8400, lsl #16    /* x0 = 0x84000008 */
+    hvc     #0                       /* Hypervisor call - triggers VM exit */
 
-    /* Loop forever if HLT doesn't work */
+    /* Should never reach here */
     b       .
 
     .align 4
 message:
     .asciz "Hello, World!\n"
 ```
+
+### Why Not WFI or HLT?
+
+This is an important ARM64/KVM detail that catches many developers:
+
+| Instruction | What Happens on KVM |
+|-------------|---------------------|
+| `WFI` (Wait For Interrupt) | Guest sleeps forever - **no VM exit!** KVM just waits for an interrupt that never comes. |
+| `HLT` (Debug Halt) | Causes a debug exception, not a VM exit. Used for debugging, not normal shutdown. |
+| `PSCI SYSTEM_OFF` | Proper shutdown. KVM recognizes the HVC call and returns `KVM_EXIT_SYSTEM_EVENT`. |
+
+This is why our `simple.S` from Chapter 3 also uses PSCI - it's the standard way for ARM64 guests to request shutdown.
 
 ## Updating the CLI
 
@@ -924,49 +989,16 @@ def run_binary(
 Build and run the hello world program:
 
 ```bash
-cd /path/to/workspace/veleiro-god
+cd ~/workplace/veleiro-god
 
-# Create the hello world program
-cat > tests/guest_code/hello.S << 'EOF'
-    .global _start
-    .equ UART_BASE, 0x09000000
-    .equ UART_DR,   0x000
-    .equ UART_FR,   0x018
-    .equ UART_FR_TXFF, (1 << 5)
-
-_start:
-    mov     x1, #0x0000
-    movk    x1, #0x0900, lsl #16
-    adr     x2, message
-
-print_loop:
-    ldrb    w0, [x2], #1
-    cbz     w0, done
-
-wait_tx_ready:
-    ldr     w3, [x1, #UART_FR]
-    tst     w3, #UART_FR_TXFF
-    b.ne    wait_tx_ready
-    str     w0, [x1, #UART_DR]
-    b       print_loop
-
-done:
-    hlt     #0
-    b       .
-
-    .align 4
-message:
-    .asciz "Hello, World!\n"
-EOF
-
-# Assemble and link
+# Assemble the hello.S we already have (with PSCI shutdown)
 aarch64-linux-gnu-as -o tests/guest_code/hello.o tests/guest_code/hello.S
 aarch64-linux-gnu-ld -nostdlib -static -Ttext=0x40080000 \
     -o tests/guest_code/hello tests/guest_code/hello.o
 aarch64-linux-gnu-objcopy -O binary tests/guest_code/hello tests/guest_code/hello.bin
 
 # Run it!
-uv run god run tests/guest_code/hello.bin
+sudo uv run god run tests/guest_code/hello.bin
 ```
 
 Expected output:
@@ -977,15 +1009,17 @@ Registered device: PL011 UART at 0x09000000
 PC = 0x0000000040080000
 SP = 0x0000000044000000
 
-Loaded 64 bytes at 0x40080000
+Loaded 79 bytes at 0x40080000
 ============================================================
 Guest output:
 ------------------------------------------------------------
 Hello, World!
 ------------------------------------------------------------
 
-Guest halted after 32 exits
+Guest stopped after 29 exits
 ```
+
+Note: It says "stopped" not "halted" because PSCI SYSTEM_OFF causes `KVM_EXIT_SYSTEM_EVENT`, not `KVM_EXIT_HLT`. Both mean the guest terminated successfully.
 
 **We did it!** Our virtual machine just printed "Hello, World!"
 

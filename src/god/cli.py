@@ -147,20 +147,27 @@ def run_binary(
         "-r",
         help="RAM size in megabytes",
     ),
+    with_uart: bool = typer.Option(
+        True,
+        "--uart/--no-uart",
+        help="Enable PL011 UART for serial console output",
+    ),
 ):
     """
     Run a binary in the VM.
 
     Loads the binary at the entry point address and runs until it halts.
+    By default, the PL011 UART is enabled so guest code can print output.
 
     Example:
-        god run tests/guest_code/simple.bin
+        god run tests/guest_code/hello.bin
         god run my_kernel.bin --entry 0x40000000 --ram 128
     """
     from god.kvm.system import KVMSystem, KVMError
     from god.vm.vm import VirtualMachine, VMError
     from god.vcpu.runner import VMRunner, RunnerError
     from god.vcpu import registers
+    from god.devices import DeviceRegistry, PL011UART
 
     # Parse entry point (support hex with 0x prefix or decimal)
     entry_point = int(entry, 16) if entry.startswith("0x") else int(entry)
@@ -172,11 +179,15 @@ def run_binary(
     try:
         with KVMSystem() as kvm:
             with VirtualMachine(kvm, ram_size=ram_bytes) as vm:
-                print(f"VM created: fd={vm.fd}")
+                # Set up device registry
+                devices = DeviceRegistry()
 
-                runner = VMRunner(vm, kvm)
+                if with_uart:
+                    uart = PL011UART()
+                    devices.register(uart)
+
+                runner = VMRunner(vm, kvm, devices)
                 vcpu = runner.create_vcpu()
-                print(f"vCPU created: fd={vcpu.fd}")
 
                 # Set initial register state
                 # PC = entry point (where code starts)
@@ -197,51 +208,27 @@ def run_binary(
                 )
                 vcpu.set_pstate(pstate)
 
-                print()
-                print("Initial register state:")
-                print(f"  PC     = 0x{entry_point:016x}")
-                print(f"  SP     = 0x{stack_top:016x}")
-                print(f"  PSTATE = 0x{pstate:016x}")
+                print(f"PC = 0x{entry_point:016x}")
+                print(f"SP = 0x{stack_top:016x}")
                 print()
 
                 # Load the binary
-                print(f"Loading {binary}...")
                 runner.load_binary(binary, entry_point)
 
                 # Run!
-                print()
-                print("Running...")
+                print("=" * 60)
+                print("Guest output:")
                 print("-" * 60)
 
-                stats = runner.run()
+                stats = runner.run(quiet=True)
 
                 print("-" * 60)
                 print()
-                print("Execution finished!")
-                print(f"  Total exits: {stats['exits']}")
-                print(f"  Exit reason: {stats['exit_reason']}")
-                print(f"  Guest halted: {stats['hlt']}")
-
-                if stats["exit_counts"]:
-                    print("  Exit breakdown:")
-                    for reason, count in stats["exit_counts"].items():
-                        print(f"    {reason}: {count}")
-
-                # Check if our test value was written (for simple.bin test)
-                test_addr = 0x40001000
-                try:
-                    data = vm.memory.read(test_addr, 8)
-                    value = int.from_bytes(data, "little")
-                    print()
-                    print(f"Memory at 0x{test_addr:08x}: 0x{value:016x}")
-                    if value == 0xDEADBEEF:
-                        print("SUCCESS! Guest wrote expected value.")
-                except Exception:
-                    # Address might not be in RAM range - that's OK
-                    pass
+                print(f"Guest {'halted' if stats['hlt'] else 'stopped'} "
+                      f"after {stats['exits']} exits")
 
     except (KVMError, VMError, RunnerError) as e:
-        print(f"Error: {e}")
+        print(f"\nError: {e}")
         raise typer.Exit(code=1)
 
 

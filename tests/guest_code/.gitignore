@@ -3,3 +3,4 @@
 
 # ELF executables (keep .bin which is the raw binary we load)
 simple
+hello
