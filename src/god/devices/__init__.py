@@ -8,14 +8,15 @@ There are two types of devices:
    memory accesses. Examples: UART, virtio devices.
 2. In-kernel devices: Emulated by KVM for performance. Examples: GIC, timer.
 
-The GIC is special - it's an in-kernel device that we configure but don't
-emulate ourselves. KVM handles the actual interrupt routing.
+The GIC and timer are special—they're in-kernel devices that we configure
+but don't emulate ourselves. KVM handles the actual emulation.
 """
 
 from .device import Device, MMIOAccess, MMIOResult
 from .registry import DeviceRegistry
 from .uart import PL011UART
 from .gic import GIC, GICError
+from .timer import Timer, TIMER_PPI_VIRTUAL, TIMER_PPI_NONSECURE_PHYS
 
 __all__ = [
     # MMIO device infrastructure
@@ -28,4 +29,7 @@ __all__ = [
     # In-kernel devices
     "GIC",
     "GICError",
+    "Timer",
+    "TIMER_PPI_VIRTUAL",
+    "TIMER_PPI_NONSECURE_PHYS",
 ]
