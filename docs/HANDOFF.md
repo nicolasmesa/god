@@ -89,8 +89,8 @@ veleiro-god/
 | 04 | Serial Console (PL011) | Draft |
 | 05 | Interrupt Controller (GIC) | Draft |
 | 06 | Timer | Draft |
-| 07 | Virtio Devices | Draft |
-| 08 | Booting Linux | Draft |
+| 07 | Booting Linux | Draft |
+| 08 | Virtio Devices | Draft |
 | 09 | Appendix | Draft |
 
 ---

@@ -287,8 +287,8 @@ We'll build the VMM incrementally. Each chapter adds one major capability:
 4. **Chapter 4**: Emulate a serial port, see "Hello World"
 5. **Chapter 5**: Set up the interrupt controller
 6. **Chapter 6**: Add a timer
-7. **Chapter 7**: Add virtio devices (better I/O)
-8. **Chapter 8**: Boot Linux!
+7. **Chapter 7**: Boot Linux!
+8. **Chapter 8**: Add virtio devices (better I/O)
 9. **Chapter 9**: Reference and appendix
 
 ### Test at Every Step

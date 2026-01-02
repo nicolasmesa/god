@@ -1,4 +1,4 @@
-# Chapter 8: Booting Linux - The Grand Finale
+# Chapter 7: Booting Linux - The Grand Finale
 
 This is the culmination of everything we've built. In this chapter, we'll boot a real Linux kernel in our virtual machine!
 
@@ -566,14 +566,10 @@ If initramfs doesn't mount:
 
 **Congratulations!** You've built a Virtual Machine Monitor from scratch and booted Linux!
 
-Future improvements:
-- Multiple CPUs (SMP)
+In Chapter 8, we'll implement **virtio** - the paravirtualization standard that makes I/O much more efficient than the UART we're using now. With virtio, we can add:
+- Efficient console (virtio-console)
+- Block devices (virtio-blk) for real filesystems
 - Networking (virtio-net)
-- Better storage (virtio-blk with real filesystem)
-- GUI (virtio-gpu)
-- Live migration
-- Performance optimization
+- Graphics (virtio-gpu)
 
-See Chapter 9 for reference material and further reading.
-
-[Continue to Chapter 9: Appendix →](09-appendix.md)
+[Continue to Chapter 8: Virtio Devices →](08-virtio-devices.md)

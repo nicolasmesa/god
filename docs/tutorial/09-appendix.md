@@ -69,8 +69,8 @@ veleiro-god/
 │       ├── 04-serial-console.md
 │       ├── 05-interrupt-controller.md
 │       ├── 06-timer.md
-│       ├── 07-virtio-devices.md
-│       ├── 08-booting-linux.md
+│       ├── 07-booting-linux.md
+│       ├── 08-virtio-devices.md
 │       └── 09-appendix.md
 │
 ├── pyproject.toml               # Project configuration

@@ -1083,7 +1083,7 @@ If the guest accesses a register we don't handle, we return 0 for reads and igno
 >
 > **Why this is slow**: VM exits are expensive—thousands of CPU cycles each. A production VMM would use `virtio-console` which batches characters, reducing exits dramatically.
 >
-> **Why we did it this way**: PL011 is simpler to implement and teaches MMIO emulation fundamentals. We'll add virtio-console in Chapter 7.
+> **Why we did it this way**: PL011 is simpler to implement and teaches MMIO emulation fundamentals. We'll add virtio-console in Chapter 8.
 
 ## What's Next?
 

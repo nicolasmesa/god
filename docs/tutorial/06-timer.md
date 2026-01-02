@@ -964,6 +964,6 @@ In this chapter, we:
 4. Configured the timer Device Tree properties with correct PPI offsets
 5. Wrote a test program demonstrating timer interrupts
 
-With the GIC and timer in place, we have the essential interrupt infrastructure for Linux. In the next chapter, we'll implement virtio devices for efficient I/O—giving us fast console and block storage support.
+With the GIC and timer in place, we have the essential interrupt infrastructure for Linux. In the next chapter, we'll put everything together and boot a real Linux kernel!
 
-[Continue to Chapter 7: Virtio Devices →](07-virtio-devices.md)
+[Continue to Chapter 7: Booting Linux →](07-booting-linux.md)

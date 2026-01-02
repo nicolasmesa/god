@@ -1,4 +1,4 @@
-# Chapter 7: Virtio Devices - Efficient Paravirtualization
+# Chapter 8: Virtio Devices - Efficient Paravirtualization
 
 In this chapter, we'll implement **virtio** devices for efficient guest-host communication. This is a meaty chapter - virtio is the standard for paravirtualized I/O in Linux VMs, and understanding it deeply will pay dividends.
 
@@ -188,7 +188,13 @@ class RingBuffer:
     def num_available(self) -> int:
         """How many items are waiting to be read?"""
         return (self.write_idx - self.read_idx) % self.size
+
+    def is_full(self) -> bool:
+        """Check if buffer is full (would overwrite unread data)."""
+        return self.num_available() >= self.size - 1
 ```
+
+Note the `is_full()` check - this is critical. Without it, a producer that writes too fast would overwrite data the consumer hasn't read yet. In virtio, we use similar logic to prevent the guest from submitting more requests than the queue can hold.
 
 Let's trace through an example with size=4:
 
@@ -746,12 +752,9 @@ available ring, and used ring. It provides methods to read descriptors
 from guest memory and process I/O requests.
 """
 
-import logging
 import struct
 from dataclasses import dataclass
 from typing import Callable
-
-logger = logging.getLogger(__name__)
 
 # Descriptor flags
 VIRTQ_DESC_F_NEXT = 1       # Descriptor is chained
@@ -835,6 +838,7 @@ class Virtqueue:
 
         # Runtime state
         self._last_avail_idx = 0  # Last available index we processed
+        self._last_used_idx = 0   # Last used index we wrote
 
     def reset(self):
         """Reset queue to initial state."""
@@ -844,6 +848,7 @@ class Virtqueue:
         self.avail_addr = 0
         self.used_addr = 0
         self._last_avail_idx = 0
+        self._last_used_idx = 0
 
     # ─────────────────────────────────────────────────────────────
     # Reading from guest memory
@@ -952,13 +957,37 @@ class Virtqueue:
         """Check if there are new requests in the available ring."""
         return self._last_avail_idx != self._avail_idx()
 
+    def num_in_flight(self) -> int:
+        """
+        Number of requests in flight (submitted but not yet completed).
+
+        This is the difference between what we've taken from the available
+        ring and what we've put in the used ring.
+        """
+        return (self._last_avail_idx - self._last_used_idx) & 0xFFFF
+
+    def is_full(self) -> bool:
+        """
+        Check if the queue is full.
+
+        Returns True if accepting another request would overflow the queue.
+        The guest should not submit more requests than queue size, but we
+        check defensively.
+        """
+        return self.num_in_flight() >= self.num
+
     def get_next_request(self) -> int | None:
         """
         Get the next request (descriptor chain head) from the available ring.
 
-        Returns the descriptor head index, or None if no new requests.
-        Updates internal tracking of processed requests.
+        Returns the descriptor head index, or None if no new requests
+        or if the queue is full (too many in-flight requests).
         """
+        # Don't accept more requests if we'd overflow
+        if self.is_full():
+            print(f"Queue {self.index}: full, rejecting request")
+            return None
+
         avail_idx = self._avail_idx()
 
         if self._last_avail_idx == avail_idx:
@@ -970,11 +999,6 @@ class Virtqueue:
 
         # Mark this entry as processed
         self._last_avail_idx += 1
-
-        logger.debug(
-            f"Queue {self.index}: got request, head={desc_head}, "
-            f"avail_idx={avail_idx}, processed={self._last_avail_idx}"
-        )
 
         return desc_head
 
@@ -1019,10 +1043,8 @@ class Virtqueue:
         # Increment the used index (this publishes the entry to the guest)
         self._set_used_idx(used_idx + 1)
 
-        logger.debug(
-            f"Queue {self.index}: completed request, head={desc_head}, "
-            f"bytes_written={bytes_written}, used_idx={used_idx + 1}"
-        )
+        # Track completions for overflow protection
+        self._last_used_idx += 1
 ```
 
 ### Step 2: Virtio MMIO Transport
@@ -1037,7 +1059,6 @@ This implements the memory-mapped register interface for virtio devices.
 Specific device types (console, block, etc.) inherit from VirtioMMIODevice.
 """
 
-import logging
 from abc import abstractmethod
 from typing import TYPE_CHECKING
 
@@ -1046,8 +1067,6 @@ from god.devices.virtio.queue import Virtqueue
 
 if TYPE_CHECKING:
     from god.memory import Memory
-
-logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Register offsets
@@ -1244,7 +1263,7 @@ class VirtioMMIODevice(Device):
         """Get the currently selected queue, or None if invalid."""
         if 0 <= self._queue_sel < len(self._queues):
             return self._queues[self._queue_sel]
-        logger.warning(f"Invalid queue selection: {self._queue_sel}")
+        print(f"Warning: Invalid queue selection: {self._queue_sel}")
         return None
 
     # ─────────────────────────────────────────────────────────────
@@ -1313,7 +1332,6 @@ class VirtioMMIODevice(Device):
             return self.read_config(config_offset, size)
 
         else:
-            logger.debug(f"Unhandled virtio read at offset 0x{offset:03x}")
             return 0
 
     # ─────────────────────────────────────────────────────────────
@@ -1349,7 +1367,7 @@ class VirtioMMIODevice(Device):
             if queue:
                 queue.ready = bool(value)
                 if value:
-                    logger.info(
+                    print(
                         f"Queue {self._queue_sel} ready: "
                         f"desc=0x{queue.desc_addr:x}, "
                         f"avail=0x{queue.avail_addr:x}, "
@@ -1363,7 +1381,7 @@ class VirtioMMIODevice(Device):
             if 0 <= queue_index < len(self._queues):
                 self.queue_notify(queue_index)
             else:
-                logger.warning(f"Invalid queue notify: {queue_index}")
+                print(f"Warning: Invalid queue notify: {queue_index}")
 
         elif offset == VIRTIO_MMIO_INTERRUPT_ACK:
             # Guest acknowledges interrupt bits
@@ -1373,7 +1391,7 @@ class VirtioMMIODevice(Device):
             self._status = value
             if value == 0:
                 # Reset device
-                logger.info("Virtio device reset")
+                print("Virtio device reset")
                 self.reset()
 
         elif offset == VIRTIO_MMIO_QUEUE_DESC_LOW:
@@ -1411,9 +1429,6 @@ class VirtioMMIODevice(Device):
             config_offset = offset - VIRTIO_MMIO_CONFIG
             self.write_config(config_offset, size, value)
 
-        else:
-            logger.debug(f"Unhandled virtio write at offset 0x{offset:03x}: 0x{value:x}")
-
     def reset(self):
         """Reset device to initial state."""
         self._status = 0
@@ -1438,7 +1453,6 @@ A paravirtualized console that's more efficient than UART because
 it can batch multiple characters per notification.
 """
 
-import logging
 import sys
 from typing import TYPE_CHECKING, Callable
 
@@ -1447,8 +1461,6 @@ from god.devices.virtio.queue import VIRTQ_DESC_F_WRITE
 
 if TYPE_CHECKING:
     from god.memory import Memory
-
-logger = logging.getLogger(__name__)
 
 # Virtio console feature bits
 VIRTIO_CONSOLE_F_SIZE = 0        # Console has configurable size
@@ -1534,7 +1546,7 @@ class VirtioConsole(VirtioMMIODevice):
         queue = self._queues[VIRTIO_CONSOLE_QUEUE_TX]
 
         if not queue.ready:
-            logger.warning("TX queue not ready")
+            print("Warning: TX queue not ready")
             return
 
         # Process all available requests
@@ -1550,7 +1562,7 @@ class VirtioConsole(VirtioMMIODevice):
             for desc in chain:
                 # TX descriptors should be read-only (device reads from them)
                 if desc.is_write:
-                    logger.warning("TX descriptor unexpectedly marked as write")
+                    print("Warning: TX descriptor unexpectedly marked as write")
                     continue
 
                 # Read data from guest buffer
@@ -1594,7 +1606,7 @@ class VirtioConsole(VirtioMMIODevice):
             for desc in chain:
                 # RX descriptors should be write-only (device writes to them)
                 if not desc.is_write:
-                    logger.warning("RX descriptor not marked as write")
+                    print("Warning: RX descriptor not marked as write")
                     continue
 
                 # How much can we write to this buffer?
@@ -1866,9 +1878,9 @@ class TestVirtioConsole:
         assert self.irq_raised
 ```
 
-### Option 2: Full Integration Test (Chapter 8)
+### Option 2: Full Integration Test (Chapter 7)
 
-In Chapter 8, we'll boot Linux, and the Linux virtio drivers will fully test our implementation. That's the real validation.
+In Chapter 7, we booted Linux. If you've done that first, the Linux virtio drivers will fully test our implementation when we integrate this. That's the real validation.
 
 ## What We Built
 
@@ -1905,13 +1917,11 @@ For larger messages (logging, file transfers), the difference is even more drama
 
 ## What's Next?
 
-In the next chapter, we'll boot Linux! We'll bring together everything we've built:
-- Memory management
-- vCPU and run loop
-- GIC (interrupts)
-- Timer
-- Virtio console
+Now that we have virtio infrastructure, we can extend it to add:
+- **virtio-blk** - Boot from a disk image instead of initramfs
+- **virtio-net** - Networking support
+- **virtio-gpu** - Graphics output
 
-And finally see a real Linux kernel running in our VM.
+The virtio framework we built makes all of these straightforward - they just implement different queue handlers and device-specific logic on top of the same MMIO transport.
 
-[Continue to Chapter 8: Booting Linux →](08-booting-linux.md)
+[Continue to Chapter 9: Appendix →](09-appendix.md)
