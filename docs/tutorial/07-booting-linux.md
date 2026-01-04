@@ -118,15 +118,16 @@ For booting Linux, we set PSTATE to:
 
 ```python
 PSTATE_MODE_EL1H = 0x5  # EL1, using SP_EL1
+PSTATE_D = 1 << 9        # Mask Debug exceptions
 PSTATE_A = 1 << 8        # Mask SError
 PSTATE_I = 1 << 7        # Mask IRQ
 PSTATE_F = 1 << 6        # Mask FIQ
 
-boot_pstate = PSTATE_MODE_EL1H | PSTATE_A | PSTATE_I | PSTATE_F
-# Result: 0x1C5
+boot_pstate = PSTATE_MODE_EL1H | PSTATE_D | PSTATE_A | PSTATE_I | PSTATE_F
+# Result: 0x3C5
 ```
 
-This says: "Run at EL1 with dedicated stack pointer, all interrupts masked."
+This says: "Run at EL1 with dedicated stack pointer, all exceptions masked." We include PSTATE_D to mask debug exceptions during early boot—these would otherwise cause VM exits before the kernel sets up its own handlers.
 
 ## The MMU (Memory Management Unit)
 
@@ -554,10 +555,15 @@ Here's the complete DTS:
     #address-cells = <2>;
     #size-cells = <2>;
 
+    // Device aliases for consistent naming
+    aliases {
+        serial0 = "/soc/pl011@9000000";
+    };
+
     // Boot configuration
     chosen {
         bootargs = "console=ttyAMA0 earlycon=pl011,0x09000000";
-        stdout-path = "/pl011@9000000";
+        stdout-path = "/soc/pl011@9000000";
         // linux,initrd-start and linux,initrd-end added dynamically
     };
 
@@ -593,11 +599,13 @@ Here's the complete DTS:
         interrupt-controller;
         reg = <0x00 0x08000000 0x00 0x10000>,   // Distributor: 64 KB
               <0x00 0x080a0000 0x00 0x100000>;  // Redistributor: 1 MB
+        phandle = <1>;  // For interrupt-parent references
     };
 
     // ARM architected timer
     timer {
         compatible = "arm,armv8-timer";
+        interrupt-parent = <&intc>;
         interrupts = <1 13 0x04>,  // Secure physical timer
                      <1 14 0x04>,  // Non-secure physical timer
                      <1 11 0x04>,  // Virtual timer
@@ -605,23 +613,43 @@ Here's the complete DTS:
         always-on;
     };
 
-    // Serial console (PL011 UART)
-    pl011@9000000 {
-        compatible = "arm,pl011", "arm,primecell";
-        reg = <0x00 0x09000000 0x00 0x1000>;
-        interrupts = <0 1 4>;
-        clock-names = "uartclk", "apb_pclk";
-        clocks = <&apb_pclk>, <&apb_pclk>;
-    };
-
-    // Fixed clock for UART
-    apb_pclk: clock {
+    // Fixed clock for UART (24 MHz)
+    apb_pclk: apb-pclk {
         compatible = "fixed-clock";
         #clock-cells = <0>;
-        clock-frequency = <24000000>;  // 24 MHz
+        clock-frequency = <24000000>;
+        phandle = <2>;
+    };
+
+    // SOC bus containing platform devices
+    soc {
+        compatible = "simple-bus";
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;  // 1:1 address mapping
+
+        // Serial console (PL011 UART)
+        pl011@9000000 {
+            compatible = "arm,pl011", "arm,primecell";
+            status = "okay";
+            arm,primecell-periphid = <0x00241011>;  // PL011 peripheral ID
+            reg = <0x00 0x09000000 0x00 0x1000>;
+            interrupt-parent = <&intc>;
+            interrupts = <0 1 4>;  // SPI 1, level triggered
+            clock-names = "uartclk", "apb_pclk";
+            clocks = <&apb_pclk>, <&apb_pclk>;
+        };
     };
 };
 ```
+
+There are several important details in this Device Tree that ensure proper device driver binding:
+
+**The `soc` node**: AMBA devices like the PL011 UART must be under a `simple-bus` compatible parent node. This tells Linux to probe child devices using the platform device model.
+
+**The `aliases` node**: Provides stable device naming. `serial0 = "/soc/pl011@9000000"` ensures the UART is always named `ttyAMA0`.
+
+**The `arm,primecell-periphid` property**: This is crucial! AMBA devices identify themselves via a peripheral ID register. When that register isn't available (as in our virtual UART), we must provide the ID in the Device Tree. `0x00241011` is the standard PL011 peripheral ID.
 
 ### Node-by-Node Explanation
 
@@ -644,7 +672,7 @@ Here's the complete DTS:
 ```dts
 chosen {
     bootargs = "console=ttyAMA0 earlycon=pl011,0x09000000";
-    stdout-path = "/pl011@9000000";
+    stdout-path = "/soc/pl011@9000000";
 };
 ```
 
@@ -657,11 +685,11 @@ The `chosen` node isn't hardware—it's boot configuration:
 
 For initramfs, we add:
 ```dts
-linux,initrd-start = <0x00 0x42000000>;
-linux,initrd-end = <0x00 0x42500000>;
+linux,initrd-start = <0x00 0x48000000>;
+linux,initrd-end = <0x00 0x48080000>;
 ```
 
-These tell the kernel where we loaded the initramfs in RAM.
+These tell the kernel where we loaded the initramfs in RAM (at 128 MB offset from RAM base).
 
 #### Memory Node
 
@@ -805,32 +833,71 @@ The ARM architected timer is built into every ARM64 CPU. The four interrupts are
 
 **Note**: There's no `reg` property because the timer uses system registers (MSR/MRS), not MMIO.
 
+#### SOC Node
+
+```dts
+soc {
+    compatible = "simple-bus";
+    #address-cells = <2>;
+    #size-cells = <2>;
+    ranges;
+
+    pl011@9000000 { ... };
+};
+```
+
+The SOC node groups platform devices under a `simple-bus`. This is important for AMBA devices:
+
+- `compatible = "simple-bus"`: Tells Linux to enumerate children as platform devices
+- `ranges`: Creates 1:1 address mapping between parent and child address spaces
+- Child devices (like our UART) go inside this node
+
+Without the SOC wrapper, the PL011 driver might not properly probe the device.
+
 #### UART Node
 
 ```dts
 pl011@9000000 {
     compatible = "arm,pl011", "arm,primecell";
+    status = "okay";
+    arm,primecell-periphid = <0x00241011>;
     reg = <0x00 0x09000000 0x00 0x1000>;
+    interrupt-parent = <&intc>;
     interrupts = <0 1 4>;
     clock-names = "uartclk", "apb_pclk";
     clocks = <&apb_pclk>, <&apb_pclk>;
 };
 ```
 
-- `reg`: UART registers at 0x09000000, size 4 KB
+Several properties here are critical:
+
+- `status = "okay"`: Explicitly enables this device
+- `arm,primecell-periphid = <0x00241011>`: The PL011 peripheral ID. AMBA devices normally identify via a hardware ID register; since we're emulating, we provide it here. Without this, the driver won't bind!
+- `interrupt-parent = <&intc>`: References the GIC via its phandle
 - `interrupts = <0 1 4>`: SPI 1 (IRQ 33), level-triggered
 - `clock-names` and `clocks`: The UART needs clock references
   - `uartclk`: Baud rate generation
   - `apb_pclk`: Bus clock
   - Both reference the `apb_pclk` fixed clock node
 
+#### Aliases Node
+
+```dts
+aliases {
+    serial0 = "/soc/pl011@9000000";
+};
+```
+
+Aliases provide stable device naming. Without this, device enumeration order might affect names. `serial0` maps to `ttyAMA0`, ensuring our UART is always the primary serial port.
+
 #### Clock Node
 
 ```dts
-apb_pclk: clock {
+apb_pclk: apb-pclk {
     compatible = "fixed-clock";
     #clock-cells = <0>;
     clock-frequency = <24000000>;
+    phandle = <2>;
 };
 ```
 
@@ -838,6 +905,7 @@ This defines a 24 MHz fixed clock. The UART driver reads this to calculate baud 
 
 - `apb_pclk:` is a label so other nodes can reference it as `<&apb_pclk>`
 - `#clock-cells = <0>`: No additional specifier needed when referencing
+- `phandle = <2>`: Explicit phandle for programmatic DTB generation
 
 ### Compiling DTS to DTB
 
@@ -1101,42 +1169,51 @@ Guest Physical Address Space:
 0x40000000 ┌─────────────────────────────────────┐ RAM_BASE
            │  (reserved for early boot)           │
            │                                      │
-0x40080000 ├──────────────────────────────────────┤ KERNEL_ADDR
+0x40080000 ├──────────────────────────────────────┤ KERNEL_ADDR (text_offset=0x80000)
            │                                      │
            │         Linux Kernel Image           │
-           │         (~15-30 MB)                  │
+           │         (~3-30 MB)                   │
            │                                      │
-           ├──────────────────────────────────────┤ (kernel_end, 4KB aligned)
+           │  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │ (gap: kernel early allocations)
+           │                                      │
+0x48000000 ├──────────────────────────────────────┤ INITRD_ADDR (128 MB offset)
            │                                      │
            │         Initramfs                    │
-           │         (~1-50 MB)                   │
+           │         (~0.5-50 MB)                 │
            │                                      │
+           ├──────────────────────────────────────┤ (page aligned after initramfs)
+           │         Device Tree Blob             │
+           │         (~2 KB)                      │
            ├──────────────────────────────────────┤
            │                                      │
            │         (free space)                 │
-           │                                      │
-           ├──────────────────────────────────────┤ DTB_ADDR (RAM_END - 2MB)
-           │         Device Tree Blob             │
-           │         (~64 KB)                     │
            │                                      │
 0x80000000 └─────────────────────────────────────┘ RAM_END (with 1GB RAM)
 ```
 
 ### Placement Decisions
 
-**Kernel at RAM_BASE + 0x80000**
+**Kernel at RAM_BASE + text_offset**
 - Required by ARM64 boot protocol
-- The `text_offset` from the kernel header tells us exactly where
+- The `text_offset` from the kernel header tells us exactly where (typically 0x80000)
+- Modern kernels with `text_offset = 0` can be placed anywhere
 
-**Initramfs after kernel**
-- Must not overlap with kernel
-- Aligned to page boundary (4 KB) for efficiency
-- Location passed to kernel via Device Tree
+**Initramfs at 128 MB offset (0x48000000)**
 
-**DTB near end of RAM**
-- Convention, not requirement
-- Keeps it away from kernel's early memory usage
-- We place it 2 MB before RAM end (plenty of space)
+This might seem wasteful—why not place it right after the kernel? The reason is **early kernel memory allocations**.
+
+During boot, the kernel performs various allocations starting from the end of its loaded image. If we place the initramfs immediately after the kernel, these allocations can overwrite the initramfs before it's unpacked! The symptom is a cryptic error:
+
+```
+Initramfs unpacking failed: invalid magic at start of compressed archive
+```
+
+By placing the initramfs at a fixed 128 MB offset, we leave plenty of room for early allocations. The kernel's `memblock` allocator starts at low addresses, so our high-offset initramfs stays safe.
+
+**DTB after initramfs**
+- Placed immediately after initramfs (page-aligned)
+- DTBs are small (~2 KB for our VM), so placement is flexible
+- Must be within the kernel's initial identity-mapped region
 
 ### Why These Specific Addresses?
 
@@ -1151,13 +1228,14 @@ This is convention from QEMU's "virt" machine. The first 1 GB is reserved for:
 
 Starting RAM at 1 GB gives plenty of space for device MMIO.
 
-**DTB at RAM_END - 2 MB**
+**INITRD at RAM_BASE + 128 MB**
 
-The 2 MB offset is generous—DTBs are typically 32-64 KB. We want the DTB far from:
-- The kernel (which grows downward during decompression)
-- The initramfs (which the kernel copies/extracts)
+The 128 MB offset provides ample space for:
+- The kernel image (~3-30 MB depending on config)
+- Early kernel allocations (page tables, per-CPU data, etc.)
+- A safety margin to avoid accidental overwrites
 
-Any reasonable offset works; 2 MB is safe and conventional.
+Firecracker and other production VMMs use similar strategies—placing the initramfs at a fixed high offset rather than immediately after the kernel.
 
 ## Implementation: The Boot Module
 
@@ -1357,7 +1435,7 @@ guest memory and setting up the vCPU state for boot.
 from dataclasses import dataclass
 from pathlib import Path
 
-from god.vm.layout import RAM_BASE, KERNEL_OFFSET
+from god.vm.layout import RAM_BASE
 from god.vm.memory import MemoryManager
 from god.vcpu import registers
 
@@ -1397,8 +1475,8 @@ class BootLoader:
 
     This class handles:
     - Loading the kernel at the correct offset
-    - Loading initramfs after the kernel
-    - Placing the DTB at a safe location
+    - Loading initramfs at a safe location (128 MB into RAM)
+    - Placing the DTB after the initramfs
     - Setting up vCPU registers for boot
 
     Usage:
@@ -1448,28 +1526,32 @@ class BootLoader:
         if dtb_data is None:
             raise ValueError("DTB data is required")
 
-        # Load kernel
+        # Load kernel at RAM_BASE + text_offset
         kernel = KernelImage.load(kernel_path)
         kernel_addr = self._ram_base + kernel.text_offset
         self._memory.write(kernel_addr, kernel.data)
         print(f"Loaded kernel at 0x{kernel_addr:08x} ({len(kernel.data)} bytes)")
 
-        # Calculate where initramfs goes (after kernel, page-aligned)
-        kernel_end = kernel_addr + len(kernel.data)
-        initrd_addr = (kernel_end + 0xFFF) & ~0xFFF  # Align to 4KB
+        # Place initramfs at 128 MB into RAM to avoid early kernel allocations
+        # The kernel's memblock allocator can overwrite data placed immediately
+        # after the kernel image, causing "invalid magic" errors during unpack.
+        initrd_addr = self._ram_base + (128 * 1024 * 1024)  # 128 MB offset
+        initrd_addr = (initrd_addr + 0xFFF) & ~0xFFF  # Align to 4KB
 
         # Load initramfs
         initrd_size = 0
+        next_addr = initrd_addr
         if initrd_path is not None:
             initrd_path = Path(initrd_path)
             with open(initrd_path, "rb") as f:
                 initrd_data = f.read()
             self._memory.write(initrd_addr, initrd_data)
             initrd_size = len(initrd_data)
+            next_addr = initrd_addr + initrd_size
             print(f"Loaded initramfs at 0x{initrd_addr:08x} ({initrd_size} bytes)")
 
-        # Place DTB near end of RAM (2 MB before end)
-        dtb_addr = self._ram_base + self._ram_size - 0x200000
+        # Place DTB right after initramfs (page-aligned)
+        dtb_addr = (next_addr + 0xFFF) & ~0xFFF
         self._memory.write(dtb_addr, dtb_data)
         print(f"Loaded DTB at 0x{dtb_addr:08x} ({len(dtb_data)} bytes)")
 
@@ -1487,10 +1569,10 @@ class BootLoader:
         Configure vCPU registers for Linux boot.
 
         Sets up the ARM64 Linux boot protocol:
-        - x0 = DTB address
+        - x0 = DTB address (physical)
         - x1, x2, x3 = 0 (reserved)
-        - PC = kernel entry point
-        - PSTATE = EL1h with interrupts masked
+        - PC = kernel entry point (physical)
+        - PSTATE = EL1h with all exceptions masked
 
         Args:
             vcpu: The VCPU to configure
@@ -1507,10 +1589,11 @@ class BootLoader:
         # PC = kernel entry point
         vcpu.set_pc(boot_info.kernel_addr)
 
-        # PSTATE = EL1h with all interrupts masked
+        # PSTATE = EL1h with all exceptions masked
         # This is required by the ARM64 Linux boot protocol
         pstate = (
             registers.PSTATE_MODE_EL1H |  # EL1, using SP_EL1
+            registers.PSTATE_D |           # Mask Debug exceptions
             registers.PSTATE_A |           # Mask SError
             registers.PSTATE_I |           # Mask IRQ
             registers.PSTATE_F             # Mask FIQ
@@ -1532,8 +1615,8 @@ Device Tree Blob generation.
 This module generates the DTB (Device Tree Blob) that describes
 our virtual machine's hardware to the Linux kernel.
 
-We use the libfdt library for DTB generation. Install it with:
-    uv add libfdt
+We use the fdt library for DTB generation. Install it with:
+    uv add fdt
 """
 
 from dataclasses import dataclass
@@ -1576,7 +1659,7 @@ class DeviceTreeGenerator:
     - CPUs
     - GICv3 interrupt controller
     - ARM architected timer
-    - PL011 UART
+    - PL011 UART (inside SOC node)
     - PSCI for power management
 
     Usage:
@@ -1596,197 +1679,227 @@ class DeviceTreeGenerator:
             DTB as bytes
         """
         try:
-            import libfdt
+            import fdt
         except ImportError:
             raise ImportError(
-                "libfdt is required for DTB generation. "
-                "Install it with: uv add libfdt"
+                "fdt is required for DTB generation. "
+                "Install it with: uv add fdt"
             )
 
-        # Create an empty FDT with enough space
-        # We'll resize at the end to fit actual content
-        fdt = libfdt.Fdt.create_empty_tree(16384)
-
-        # Root node properties
-        fdt.setprop_str(0, "compatible", "linux,dummy-virt")
-        fdt.setprop_u32(0, "#address-cells", 2)
-        fdt.setprop_u32(0, "#size-cells", 2)
+        # Create root node
+        root = fdt.Node("/")
+        root.append(fdt.PropStrings("compatible", "linux,dummy-virt"))
+        root.append(fdt.PropWords("#address-cells", 2))
+        root.append(fdt.PropWords("#size-cells", 2))
 
         # Add all nodes
-        self._add_chosen(fdt, config)
-        self._add_memory(fdt, config)
-        self._add_cpus(fdt, config)
-        self._add_psci(fdt)
-        self._add_gic(fdt)
-        self._add_timer(fdt)
-        self._add_uart(fdt)
-        self._add_clock(fdt)
+        root.append(self._create_aliases())
+        root.append(self._create_chosen(config))
+        root.append(self._create_memory(config))
+        root.append(self._create_cpus(config))
+        root.append(self._create_psci())
+        root.append(self._create_gic())
+        root.append(self._create_timer())
+        root.append(self._create_clock())
+        root.append(self._create_soc())  # UART inside SOC
 
-        # Pack to remove unused space
-        fdt.pack()
+        # Create the FDT and convert to bytes
+        dt = fdt.FDT()
+        dt.root = root
 
-        return bytes(fdt.as_bytearray())
+        return dt.to_dtb(version=17)
 
-    def _add_chosen(self, fdt, config: DTBConfig) -> None:
-        """Add the chosen node (boot configuration)."""
-        import libfdt
+    def _create_aliases(self) -> "fdt.Node":
+        """Create the aliases node for device naming."""
+        import fdt
 
-        chosen = fdt.add_subnode(0, "chosen")
-        fdt.setprop_str(chosen, "bootargs", config.cmdline)
-        fdt.setprop_str(chosen, "stdout-path", "/pl011@9000000")
+        aliases = fdt.Node("aliases")
+        # Path includes /soc/ prefix since UART is under SOC node
+        aliases.append(fdt.PropStrings("serial0", f"/soc/pl011@{UART.base:x}"))
+        return aliases
+
+    def _create_chosen(self, config: DTBConfig) -> "fdt.Node":
+        """Create the chosen node (boot configuration)."""
+        import fdt
+
+        chosen = fdt.Node("chosen")
+        chosen.append(fdt.PropStrings("bootargs", config.cmdline))
+        # Path includes /soc/ prefix
+        chosen.append(fdt.PropStrings("stdout-path", f"/soc/pl011@{UART.base:x}"))
 
         # Add initramfs location if present
         if config.initrd_start != 0 and config.initrd_end != 0:
             # These are 64-bit addresses stored as two 32-bit values
-            start_cells = self._addr_to_cells(config.initrd_start)
-            end_cells = self._addr_to_cells(config.initrd_end)
-            fdt.setprop(chosen, "linux,initrd-start", start_cells)
-            fdt.setprop(chosen, "linux,initrd-end", end_cells)
+            chosen.append(
+                fdt.PropWords(
+                    "linux,initrd-start",
+                    config.initrd_start >> 32,
+                    config.initrd_start & 0xFFFFFFFF,
+                )
+            )
+            chosen.append(
+                fdt.PropWords(
+                    "linux,initrd-end",
+                    config.initrd_end >> 32,
+                    config.initrd_end & 0xFFFFFFFF,
+                )
+            )
 
-    def _add_memory(self, fdt, config: DTBConfig) -> None:
-        """Add the memory node."""
-        mem = fdt.add_subnode(0, f"memory@{RAM_BASE:x}")
-        fdt.setprop_str(mem, "device_type", "memory")
+        return chosen
 
-        # reg = <addr_hi addr_lo size_hi size_lo>
-        reg = self._make_reg(RAM_BASE, config.ram_size)
-        fdt.setprop(mem, "reg", reg)
+    def _create_memory(self, config: DTBConfig) -> "fdt.Node":
+        """Create the memory node."""
+        import fdt
 
-    def _add_cpus(self, fdt, config: DTBConfig) -> None:
-        """Add the cpus node."""
-        cpus = fdt.add_subnode(0, "cpus")
-        fdt.setprop_u32(cpus, "#address-cells", 1)
-        fdt.setprop_u32(cpus, "#size-cells", 0)
+        mem = fdt.Node(f"memory@{RAM_BASE:x}")
+        mem.append(fdt.PropStrings("device_type", "memory"))
+        mem.append(
+            fdt.PropWords(
+                "reg",
+                RAM_BASE >> 32,
+                RAM_BASE & 0xFFFFFFFF,
+                config.ram_size >> 32,
+                config.ram_size & 0xFFFFFFFF,
+            )
+        )
+        return mem
+
+    def _create_cpus(self, config: DTBConfig) -> "fdt.Node":
+        """Create the cpus node."""
+        import fdt
+
+        cpus = fdt.Node("cpus")
+        cpus.append(fdt.PropWords("#address-cells", 1))
+        cpus.append(fdt.PropWords("#size-cells", 0))
 
         for i in range(config.num_cpus):
-            cpu = fdt.add_subnode(cpus, f"cpu@{i}")
-            fdt.setprop_str(cpu, "device_type", "cpu")
-            fdt.setprop_str(cpu, "compatible", "arm,cortex-a57")
-            fdt.setprop_u32(cpu, "reg", i)
-            fdt.setprop_str(cpu, "enable-method", "psci")
+            cpu = fdt.Node(f"cpu@{i}")
+            cpu.append(fdt.PropStrings("device_type", "cpu"))
+            cpu.append(fdt.PropStrings("compatible", "arm,cortex-a57"))
+            cpu.append(fdt.PropWords("reg", i))
+            cpu.append(fdt.PropStrings("enable-method", "psci"))
+            cpus.append(cpu)
 
-    def _add_psci(self, fdt) -> None:
-        """Add the PSCI node."""
-        psci = fdt.add_subnode(0, "psci")
-        # List multiple compatible strings
-        fdt.setprop(psci, "compatible",
-                    b"arm,psci-1.0\x00arm,psci-0.2\x00")
-        fdt.setprop_str(psci, "method", "hvc")
+        return cpus
 
-    def _add_gic(self, fdt) -> None:
-        """Add the GIC interrupt controller node."""
-        gic = fdt.add_subnode(0, f"interrupt-controller@{GIC_DISTRIBUTOR.base:x}")
-        fdt.setprop_str(gic, "compatible", "arm,gic-v3")
-        fdt.setprop_u32(gic, "#interrupt-cells", 3)
-        fdt.setprop(gic, "interrupt-controller", b"")
+    def _create_psci(self) -> "fdt.Node":
+        """Create the PSCI node."""
+        import fdt
 
-        # reg = <dist_addr dist_size redist_addr redist_size>
-        reg = (
-            self._make_reg(GIC_DISTRIBUTOR.base, GIC_DISTRIBUTOR.size) +
-            self._make_reg(GIC_REDISTRIBUTOR.base, GIC_REDISTRIBUTOR.size)
+        psci = fdt.Node("psci")
+        psci.append(fdt.PropStrings("compatible", "arm,psci-1.0", "arm,psci-0.2"))
+        psci.append(fdt.PropStrings("method", "hvc"))
+        return psci
+
+    def _create_gic(self) -> "fdt.Node":
+        """Create the GIC interrupt controller node."""
+        import fdt
+
+        gic = fdt.Node(f"interrupt-controller@{GIC_DISTRIBUTOR.base:x}")
+        gic.append(fdt.PropStrings("compatible", "arm,gic-v3"))
+        gic.append(fdt.PropWords("#interrupt-cells", 3))
+        gic.append(fdt.Property("interrupt-controller"))
+        gic.append(
+            fdt.PropWords(
+                "reg",
+                GIC_DISTRIBUTOR.base >> 32,
+                GIC_DISTRIBUTOR.base & 0xFFFFFFFF,
+                GIC_DISTRIBUTOR.size >> 32,
+                GIC_DISTRIBUTOR.size & 0xFFFFFFFF,
+                GIC_REDISTRIBUTOR.base >> 32,
+                GIC_REDISTRIBUTOR.base & 0xFFFFFFFF,
+                GIC_REDISTRIBUTOR.size >> 32,
+                GIC_REDISTRIBUTOR.size & 0xFFFFFFFF,
+            )
         )
-        fdt.setprop(gic, "reg", reg)
+        # phandle for interrupt-parent references
+        gic.append(fdt.PropWords("phandle", 1))
+        return gic
 
-        # Set phandle so other nodes can reference this
-        gic_phandle = 1
-        fdt.setprop_u32(gic, "phandle", gic_phandle)
+    def _create_timer(self) -> "fdt.Node":
+        """Create the ARM timer node."""
+        import fdt
 
-    def _add_timer(self, fdt) -> None:
-        """Add the ARM timer node."""
-        timer_node = fdt.add_subnode(0, "timer")
-        fdt.setprop_str(timer_node, "compatible", "arm,armv8-timer")
+        timer_node = fdt.Node("timer")
+        timer_node.append(fdt.PropStrings("compatible", "arm,armv8-timer"))
+        timer_node.append(fdt.PropWords("interrupt-parent", 1))
 
         # Timer interrupts (4 PPIs)
-        # Format: <type number flags> for each
         timer = Timer()
-        interrupts = self._make_timer_interrupts(timer)
-        fdt.setprop(timer_node, "interrupts", interrupts)
-
-        fdt.setprop(timer_node, "always-on", b"")
-
-    def _add_uart(self, fdt) -> None:
-        """Add the PL011 UART node."""
-        uart = fdt.add_subnode(0, f"pl011@{UART.base:x}")
-        fdt.setprop(uart, "compatible",
-                    b"arm,pl011\x00arm,primecell\x00")
-
-        reg = self._make_reg(UART.base, UART.size)
-        fdt.setprop(uart, "reg", reg)
-
-        # UART interrupt: SPI 1, level triggered
-        # <type=0(SPI) number=1 flags=4(level)>
-        spi_num = UART_IRQ - 32  # Convert to SPI number
-        interrupts = self._make_interrupt(0, spi_num, 4)
-        fdt.setprop(uart, "interrupts", interrupts)
-
-        # Clock references
-        fdt.setprop(uart, "clock-names", b"uartclk\x00apb_pclk\x00")
-        # Reference the clock phandle (we'll use phandle 2)
-        clock_phandle = 2
-        clocks = self._u32_to_bytes(clock_phandle) + self._u32_to_bytes(clock_phandle)
-        fdt.setprop(uart, "clocks", clocks)
-
-    def _add_clock(self, fdt) -> None:
-        """Add the fixed clock node for UART."""
-        clock = fdt.add_subnode(0, "apb-pclk")
-        fdt.setprop_str(clock, "compatible", "fixed-clock")
-        fdt.setprop_u32(clock, "#clock-cells", 0)
-        fdt.setprop_u32(clock, "clock-frequency", 24000000)  # 24 MHz
-        fdt.setprop_u32(clock, "phandle", 2)
-
-    def _make_reg(self, addr: int, size: int) -> bytes:
-        """Create a reg property value (2 cells each for addr and size)."""
-        return (
-            self._u32_to_bytes(addr >> 32) +
-            self._u32_to_bytes(addr & 0xFFFFFFFF) +
-            self._u32_to_bytes(size >> 32) +
-            self._u32_to_bytes(size & 0xFFFFFFFF)
-        )
-
-    def _addr_to_cells(self, addr: int) -> bytes:
-        """Convert a 64-bit address to 2 cells (big-endian)."""
-        return (
-            self._u32_to_bytes(addr >> 32) +
-            self._u32_to_bytes(addr & 0xFFFFFFFF)
-        )
-
-    def _make_interrupt(self, int_type: int, number: int, flags: int) -> bytes:
-        """Create an interrupt specifier (3 cells)."""
-        return (
-            self._u32_to_bytes(int_type) +
-            self._u32_to_bytes(number) +
-            self._u32_to_bytes(flags)
-        )
-
-    def _make_timer_interrupts(self, timer: Timer) -> bytes:
-        """Create interrupt specifiers for all timer PPIs."""
-        # PPI type = 1, flags = 4 (level triggered)
-        # PPI numbers in DT are relative (subtract 16 from actual PPI)
-        result = b""
+        interrupts = []
         for ppi in [
-            timer.ppi_secure_phys,     # 29 -> DT 13
-            timer.ppi_nonsecure_phys,  # 30 -> DT 14
+            timer.ppi_secure_phys,      # 29 -> DT 13
+            timer.ppi_nonsecure_phys,   # 30 -> DT 14
             timer.ppi_virtual,          # 27 -> DT 11
             timer.ppi_hypervisor,       # 26 -> DT 10
         ]:
             dt_num = ppi - 16  # Convert to DT-relative number
-            result += self._make_interrupt(1, dt_num, 4)
-        return result
+            interrupts.extend([1, dt_num, 4])  # PPI type, number, level-triggered
 
-    def _u32_to_bytes(self, value: int) -> bytes:
-        """Convert a 32-bit value to big-endian bytes (DTB format)."""
-        return value.to_bytes(4, "big")
+        timer_node.append(fdt.PropWords("interrupts", *interrupts))
+        timer_node.append(fdt.Property("always-on"))
+        return timer_node
+
+    def _create_clock(self) -> "fdt.Node":
+        """Create the fixed clock node for UART."""
+        import fdt
+
+        clock = fdt.Node("apb-pclk")
+        clock.append(fdt.PropStrings("compatible", "fixed-clock"))
+        clock.append(fdt.PropWords("#clock-cells", 0))
+        clock.append(fdt.PropWords("clock-frequency", 24000000))  # 24 MHz
+        clock.append(fdt.PropWords("phandle", 2))
+        return clock
+
+    def _create_soc(self) -> "fdt.Node":
+        """Create the SOC node containing platform devices."""
+        import fdt
+
+        soc = fdt.Node("soc")
+        soc.append(fdt.PropStrings("compatible", "simple-bus"))
+        soc.append(fdt.PropWords("#address-cells", 2))
+        soc.append(fdt.PropWords("#size-cells", 2))
+        soc.append(fdt.Property("ranges"))
+
+        # Add UART inside the SOC node
+        soc.append(self._create_uart())
+        return soc
+
+    def _create_uart(self) -> "fdt.Node":
+        """Create the PL011 UART node."""
+        import fdt
+
+        uart = fdt.Node(f"pl011@{UART.base:x}")
+        uart.append(fdt.PropStrings("compatible", "arm,pl011", "arm,primecell"))
+        uart.append(fdt.PropStrings("status", "okay"))
+        # Peripheral ID is CRITICAL for AMBA device binding!
+        uart.append(fdt.PropWords("arm,primecell-periphid", 0x00241011))
+        uart.append(
+            fdt.PropWords(
+                "reg",
+                UART.base >> 32,
+                UART.base & 0xFFFFFFFF,
+                UART.size >> 32,
+                UART.size & 0xFFFFFFFF,
+            )
+        )
+        uart.append(fdt.PropWords("interrupt-parent", 1))
+        spi_num = UART_IRQ - 32  # Convert to SPI number
+        uart.append(fdt.PropWords("interrupts", 0, spi_num, 4))
+        uart.append(fdt.PropStrings("clock-names", "uartclk", "apb_pclk"))
+        uart.append(fdt.PropWords("clocks", 2, 2))
+        return uart
 ```
 
-## Adding libfdt Dependency
+## Adding fdt Dependency
 
-We need to add the `libfdt` library to our project. Update `pyproject.toml`:
+We need to add the `fdt` library to our project:
 
 ```bash
-uv add libfdt
+uv add fdt
 ```
 
-This adds the Python bindings for libfdt, which we use to generate DTBs.
+This adds a pure Python library for creating and parsing Device Tree Blobs.
 
 ## The Boot CLI Command
 
@@ -1873,8 +1986,11 @@ def boot_linux(
 
                     kernel_img = KernelImage.load(kernel)
                     kernel_addr = RAM_BASE + kernel_img.text_offset
-                    kernel_end = kernel_addr + len(kernel_img.data)
-                    initrd_addr = (kernel_end + 0xFFF) & ~0xFFF
+
+                    # Place initramfs at 128MB offset into RAM
+                    # This avoids early kernel memory allocations that could corrupt it
+                    initrd_addr = RAM_BASE + (128 * 1024 * 1024)
+                    initrd_addr = (initrd_addr + 0xFFF) & ~0xFFF  # Page align
 
                     # Calculate initrd end if we have one
                     initrd_start = 0
@@ -2650,29 +2766,88 @@ Linux (none) 6.12.0 #1 SMP ... aarch64 GNU/Linux
 
 ## Debugging Boot Failures
 
+Boot debugging can be tricky because failures often happen before any console output. Here are systematic debugging techniques.
+
+### Adding Register Dump on Timeout
+
+When the vCPU hangs, you need to see what's happening. Add system register reading to your VCPU class:
+
+```python
+# In src/god/vcpu/registers.py, add system register definitions:
+KVM_REG_ARM64_SYSREG = 0x0013 << 16
+
+def _sysreg(op0: int, op1: int, crn: int, crm: int, op2: int) -> int:
+    """Create a system register ID."""
+    return (
+        KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG
+        | (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
+    )
+
+ESR_EL1 = _sysreg(3, 0, 5, 2, 0)   # Exception Syndrome Register
+FAR_EL1 = _sysreg(3, 0, 6, 0, 0)   # Fault Address Register
+ELR_EL1 = _sysreg(3, 0, 4, 0, 1)   # Exception Link Register
+VBAR_EL1 = _sysreg(3, 0, 12, 0, 0) # Vector Base Address Register
+SCTLR_EL1 = _sysreg(3, 0, 1, 0, 0) # System Control Register
+```
+
+Then add a `dump_registers()` method to your VCPU that reads and prints these registers. When debugging, you can set a timeout and dump registers if the vCPU doesn't make progress.
+
 ### No Output At All
 
 If you see nothing after "Starting Linux...":
 
-1. **Check UART address**: Make sure earlycon address matches our UART (0x09000000)
-2. **Check DTB**: Verify the DTB is valid with `dtc -I dtb -O dts your.dtb`
-3. **Check kernel loading**: Is the kernel at the right address?
+1. **Check earlycon address**: Must match our UART (0x09000000)
+   ```
+   earlycon=pl011,0x09000000
+   ```
+
+2. **Check DTB validity**: Decompile and verify
+   ```bash
+   dtc -I dtb -O dts -o check.dts your.dtb
+   ```
+
+3. **Verify kernel magic**: The kernel should have magic `0x644d5241` at offset 56
+
+4. **Check PSTATE**: Must include D, A, I, F bits masked (0x3C5)
 
 ### "Booting Linux..." Then Silence
 
-The kernel is crashing very early. Try:
+The kernel is crashing very early. The ESR_EL1 register tells you why:
 
-1. Add `debug` to the command line for verbose output
-2. Verify the GIC is initialized before the vCPU runs
-3. Check that the timer node is in the DTB
+| ESR Exception Class | Meaning |
+|---------------------|---------|
+| 0x20 | Instruction abort from lower EL |
+| 0x21 | Instruction abort from same EL |
+| 0x24 | Data abort from lower EL |
+| 0x25 | Data abort from same EL |
+| 0x15 | SVC instruction |
+| 0x16 | HVC instruction |
 
-### Kernel Panic
+Common causes:
+1. **GIC not initialized**: Call `gic.finalize()` before running vCPU
+2. **Timer node missing from DTB**: Kernel hangs waiting for timer
+3. **Wrong kernel load address**: Check `text_offset` from kernel header
 
-Usually a driver issue. Common causes:
+### Initramfs Unpacking Failed
 
-1. Missing or incorrect DTB nodes
-2. Wrong interrupt numbers
-3. Missing clock references
+```
+Initramfs unpacking failed: invalid magic at start of compressed archive
+```
+
+This means the initramfs was corrupted before unpacking. Causes:
+
+1. **Initramfs too close to kernel**: Early kernel allocations overwrote it. Move to 128 MB offset.
+2. **Wrong DTB initrd addresses**: Verify `linux,initrd-start` and `linux,initrd-end` match actual load addresses.
+3. **Corrupted file**: Check with `file initramfs.cpio.gz` and `gunzip -t initramfs.cpio.gz`
+
+### UART Console Not Working
+
+If kernel boots but no userspace output:
+
+1. **Check UART driver binding**: Look for `ttyAMA0 at MMIO 0x9000000` in kernel output
+2. **Missing `arm,primecell-periphid`**: AMBA devices need this for driver binding
+3. **UART not under `soc` node**: Must be under a `simple-bus` compatible parent
+4. **Check stdout-path**: Should point to `/soc/pl011@9000000`
 
 ### Using earlycon
 
@@ -2682,7 +2857,19 @@ Usually a driver issue. Common causes:
 earlycon=pl011,0x09000000
 ```
 
-This uses direct hardware access, bypassing the driver framework. It's invaluable for debugging boot issues.
+This uses direct MMIO to the UART, bypassing the tty framework. If you see earlycon output but not regular console output, the problem is device binding (check DTB).
+
+### Adding Kernel Debug Options
+
+For verbose boot output, add to command line:
+
+```
+console=ttyAMA0 earlycon=pl011,0x09000000 debug loglevel=8 initcall_debug
+```
+
+- `debug`: Enable debug messages
+- `loglevel=8`: Show all message levels
+- `initcall_debug`: Show timing of each kernel init function
 
 ## What Happens During Linux Boot
 

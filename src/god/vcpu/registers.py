@@ -150,6 +150,48 @@ PSTATE_D = 1 << 9   # Debug mask
 
 
 # ============================================================================
+# System Registers
+# ============================================================================
+# System registers are accessed via a different encoding than core registers.
+# Format: KVM_REG_ARM64 | size | KVM_REG_ARM64_SYSREG | (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
+#
+# For ESR_EL1 (Exception Syndrome Register):
+#   op0=3, op1=0, crn=5, crm=2, op2=0
+# For SCTLR_EL1 (System Control Register):
+#   op0=3, op1=0, crn=1, crm=0, op2=0
+
+KVM_REG_ARM64_SYSREG = 0x0013 << 16
+
+def _sysreg(op0: int, op1: int, crn: int, crm: int, op2: int) -> int:
+    """Create a system register ID."""
+    return (
+        KVM_REG_ARM64
+        | KVM_REG_SIZE_U64
+        | KVM_REG_ARM64_SYSREG
+        | (op0 << 14)
+        | (op1 << 11)
+        | (crn << 7)
+        | (crm << 3)
+        | op2
+    )
+
+# Exception Syndrome Register - tells us what caused an exception
+ESR_EL1 = _sysreg(3, 0, 5, 2, 0)
+
+# System Control Register - controls MMU, caches, etc.
+SCTLR_EL1 = _sysreg(3, 0, 1, 0, 0)
+
+# Fault Address Register - address that caused a data/instruction abort
+FAR_EL1 = _sysreg(3, 0, 6, 0, 0)
+
+# Exception Link Register - return address after exception
+ELR_EL1 = _sysreg(3, 0, 4, 0, 1)
+
+# Vector Base Address Register - where exception vectors are
+VBAR_EL1 = _sysreg(3, 0, 12, 0, 0)
+
+
+# ============================================================================
 # Register Names (for debugging)
 # ============================================================================
 

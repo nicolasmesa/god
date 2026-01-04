@@ -234,9 +234,32 @@ class VMRunner:
         # Multi-vCPU execution requires threading (future work)
         vcpu = self._vcpus[0]
 
-        for _ in range(max_exits):
+        import signal
+        import sys
+
+        # Set up timeout handler to dump registers on hang
+        def timeout_handler(signum, frame):
+            print("\n[TIMEOUT - vCPU appears stuck, dumping registers]")
+            vcpu.dump_registers()
+            sys.exit(1)
+
+        if not quiet:
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(5)  # 5 second timeout
+
+        for i in range(max_exits):
             # Run the vCPU - this blocks until the guest exits
+            if not quiet and i < 5:
+                print(f"  [vCPU run #{i}]")
             exit_reason = vcpu.run()
+
+            # Reset timeout on each successful exit
+            if not quiet:
+                signal.alarm(5)
+
+            if not quiet and i < 5:
+                exit_name = vcpu.get_exit_reason_name(exit_reason)
+                print(f"  [vCPU exit: {exit_name}]")
 
             # Handle signal interruption (EINTR)
             # This can happen if we receive a signal while in KVM_RUN
@@ -260,6 +283,15 @@ class VMRunner:
             elif exit_reason == KVM_EXIT_MMIO:
                 # Guest tried to access memory that isn't RAM
                 # Dispatch to the device registry to handle it
+                if not quiet:
+                    if stats["exits"] <= 10:
+                        # Show first 10 MMIO accesses for debugging
+                        phys_addr, _, length, is_write = vcpu.get_mmio_info()
+                        op = "W" if is_write else "R"
+                        print(f"  MMIO[{stats['exits']}]: {op} 0x{phys_addr:08x} ({length}B)")
+                    elif stats["exits"] % 100000 == 0:
+                        # Progress indicator
+                        print(f"  ... {stats['exits']} exits ...")
                 self._handle_mmio(vcpu)
 
             elif exit_reason == KVM_EXIT_SYSTEM_EVENT:

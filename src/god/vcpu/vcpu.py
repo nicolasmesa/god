@@ -331,6 +331,46 @@ class VCPU:
         print(f"  pc     = 0x{self.get_pc():016x}")
         print(f"  pstate = 0x{self.get_pstate():016x}")
 
+        # System registers (for exception debugging)
+        print()
+        print("System Registers:")
+        try:
+            # VBAR_EL1 should be readable
+            vbar = self.get_register(registers.VBAR_EL1)
+            print(f"  VBAR_EL1  = 0x{vbar:016x}  (Exception Vector Base)")
+        except Exception as e:
+            print(f"  VBAR_EL1  = (read failed: {e})")
+
+        try:
+            esr = self.get_register(registers.ESR_EL1)
+            far = self.get_register(registers.FAR_EL1)
+            elr = self.get_register(registers.ELR_EL1)
+            sctlr = self.get_register(registers.SCTLR_EL1)
+            print(f"  ESR_EL1   = 0x{esr:016x}  (Exception Syndrome)")
+            print(f"  FAR_EL1   = 0x{far:016x}  (Fault Address)")
+            print(f"  ELR_EL1   = 0x{elr:016x}  (Exception Return)")
+            print(f"  SCTLR_EL1 = 0x{sctlr:016x}  (System Control)")
+
+            # Decode ESR_EL1
+            ec = (esr >> 26) & 0x3F  # Exception Class
+            ec_names = {
+                0x00: "Unknown",
+                0x01: "WFI/WFE",
+                0x15: "SVC in AArch64",
+                0x16: "HVC in AArch64",
+                0x17: "SMC in AArch64",
+                0x20: "Instruction Abort (lower EL)",
+                0x21: "Instruction Abort (same EL)",
+                0x22: "PC alignment",
+                0x24: "Data Abort (lower EL)",
+                0x25: "Data Abort (same EL)",
+                0x26: "SP alignment",
+            }
+            ec_name = ec_names.get(ec, f"Unknown(0x{ec:02x})")
+            print(f"  -> Exception Class: {ec_name}")
+        except Exception as e:
+            print(f"  (Could not read system registers: {e})")
+
     def close(self):
         """Close the vCPU and free resources."""
         if self._closed:
