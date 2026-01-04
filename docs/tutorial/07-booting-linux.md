@@ -21,6 +21,49 @@ On real ARM hardware, there's typically firmware (like ARM Trusted Firmware) tha
 
 Then we hand off to the kernel and let it run.
 
+## Key Terminology
+
+Before diving in, let's define the acronyms and terms you'll encounter in this chapter:
+
+### Hardware and Architecture Terms
+
+| Term | Full Name | Meaning |
+|------|-----------|---------|
+| **MMIO** | Memory-Mapped I/O | Hardware registers accessed as memory addresses. Instead of special I/O instructions, you read/write device registers using normal load/store instructions to specific addresses. |
+| **MMU** | Memory Management Unit | CPU component that translates virtual addresses to physical addresses, enabling memory protection and virtual memory. |
+| **GIC** | Generic Interrupt Controller | ARM's standard interrupt controller. Routes interrupts from devices to CPUs. |
+| **UART** | Universal Asynchronous Receiver-Transmitter | Serial communication hardware. The PL011 is ARM's standard UART design. |
+| **AMBA** | Advanced Microcontroller Bus Architecture | ARM's on-chip bus standard. The PL011 UART is an "AMBA device" that follows this bus protocol. |
+
+### Interrupt Terms
+
+| Term | Full Name | Meaning |
+|------|-----------|---------|
+| **IRQ** | Interrupt Request | A signal from hardware to the CPU saying "I need attention." |
+| **SPI** | Shared Peripheral Interrupt | Interrupts from devices (like UART). IRQ numbers 32-1019. Can be routed to any CPU. |
+| **PPI** | Private Peripheral Interrupt | Per-CPU interrupts (like timers). IRQ numbers 16-31. Each CPU has its own set. |
+| **SGI** | Software Generated Interrupt | Interrupts triggered by software. IRQ numbers 0-15. Used for inter-processor communication. |
+| **FIQ** | Fast Interrupt Request | High-priority interrupt type (rarely used in Linux). |
+
+### Boot and Firmware Terms
+
+| Term | Full Name | Meaning |
+|------|-----------|---------|
+| **DTB** | Device Tree Blob | Binary file describing hardware to the kernel. |
+| **DTS** | Device Tree Source | Human-readable text version of a Device Tree. |
+| **PSCI** | Power State Coordination Interface | ARM standard for power management calls (CPU on/off, system reset). |
+| **HVC** | Hypervisor Call | ARM instruction to call from guest (EL1) to hypervisor (EL2). |
+| **SMC** | Secure Monitor Call | ARM instruction to call secure firmware (EL3). |
+| **ACPI** | Advanced Configuration and Power Interface | x86's alternative to Device Tree for hardware description. |
+
+### Software Terms
+
+| Term | Full Name | Meaning |
+|------|-----------|---------|
+| **CPIO** | Copy In and Out | Archive format used for initramfs. Like tar, but simpler. |
+| **initramfs** | Initial RAM Filesystem | A minimal filesystem loaded into RAM at boot, containing early userspace. |
+| **BusyBox** | — | Single binary providing many Unix utilities (sh, ls, cat, etc.). |
+
 ## ARM64 Exception Levels
 
 Before we can set up the CPU for Linux boot, we need to understand ARM64's privilege model.
@@ -645,11 +688,36 @@ Here's the complete DTS:
 
 There are several important details in this Device Tree that ensure proper device driver binding:
 
-**The `soc` node**: AMBA devices like the PL011 UART must be under a `simple-bus` compatible parent node. This tells Linux to probe child devices using the platform device model.
+**The `soc` node**: AMBA devices like the PL011 UART must be under a `simple-bus` compatible parent node. This tells Linux to probe child devices using the **platform device model**—Linux's framework for devices that aren't on discoverable buses like PCI.
 
-**The `aliases` node**: Provides stable device naming. `serial0 = "/soc/pl011@9000000"` ensures the UART is always named `ttyAMA0`.
+**The `aliases` node**: Provides stable device naming. `serial0 = "/soc/pl011@9000000"` ensures the UART is always named `ttyAMA0`. Without this, the name could vary based on probe order.
 
-**The `arm,primecell-periphid` property**: This is crucial! AMBA devices identify themselves via a peripheral ID register. When that register isn't available (as in our virtual UART), we must provide the ID in the Device Tree. `0x00241011` is the standard PL011 peripheral ID.
+**The `arm,primecell-periphid` property**: This is crucial and deserves explanation.
+
+### Understanding AMBA and PrimeCell
+
+**AMBA (Advanced Microcontroller Bus Architecture)** is ARM's on-chip interconnect standard. AMBA devices, also called **PrimeCell** peripherals, are designed to work together using standard protocols. ARM's PL011 UART, PL031 RTC, and GIC are all AMBA/PrimeCell devices.
+
+On real hardware, each PrimeCell device has hardware ID registers at fixed offsets from its base address:
+
+| Offset | Register | Purpose |
+|--------|----------|---------|
+| 0xFE0-0xFEC | PeriphID0-3 | Peripheral ID (part number, designer) |
+| 0xFF0-0xFFC | PCellID0-3 | PrimeCell ID (magic number 0xB105F00D) |
+
+The Linux AMBA bus driver reads these registers to identify devices:
+1. Read PCellID registers → verify it's a PrimeCell device
+2. Read PeriphID registers → identify which peripheral (PL011, etc.)
+3. Match against drivers registered for that peripheral ID
+
+**The problem**: In our virtual UART, we only implement the core UART registers—we don't emulate the ID registers at offsets 0xFE0-0xFFF. When Linux tries to read them, it gets zeros, and the AMBA driver fails to identify the device.
+
+**The solution**: The `arm,primecell-periphid` property tells Linux "this device's peripheral ID is X" without reading hardware. `0x00241011` decodes as:
+- Designer: ARM (0x41)
+- Part number: 0x011 (PL011 UART)
+- Revision: varies
+
+This is why the UART silently fails to work if you forget this property—no error message, the driver just doesn't bind!
 
 ### Node-by-Node Explanation
 
@@ -761,16 +829,35 @@ intc: interrupt-controller@8000000 {
     interrupt-controller;
     reg = <0x00 0x08000000 0x00 0x10000>,
           <0x00 0x080a0000 0x00 0x100000>;
+    phandle = <1>;
 };
 ```
 
-- `intc:` is a **label**—other nodes can reference this as `<&intc>`
-- `compatible = "arm,gic-v3"`: GICv3 interrupt controller
-- `#interrupt-cells = <3>`: Interrupt specifiers have 3 values
-- `interrupt-controller`: This node IS an interrupt controller (empty property = true)
-- `reg`: Two regions:
-  - Distributor at 0x08000000 (64 KB)
-  - Redistributor at 0x080A0000 (1 MB)
+Let's break this down:
+
+**Labels and Phandles (Cross-References)**
+
+Device Tree nodes often need to reference each other. For example, the UART needs to say "my interrupt controller is the GIC." This is done through **phandles**:
+
+- **Label**: `intc:` before the node name creates a text label in the DTS source
+- **Phandle**: A numeric ID assigned to a node, stored in the `phandle` property
+- **Reference**: `<&intc>` in DTS becomes the phandle number in DTB
+
+When we write `interrupt-parent = <&intc>` in the UART node, the Device Tree compiler:
+1. Looks up the label `intc`
+2. Finds (or assigns) its phandle value
+3. Replaces `<&intc>` with that numeric value
+
+In our DTB generator code, we explicitly set `phandle = <1>` for the GIC and reference it with `interrupt-parent = <1>`.
+
+**Other properties explained:**
+
+- `compatible = "arm,gic-v3"`: GICv3 interrupt controller driver
+- `#interrupt-cells = <3>`: Interrupt specifiers have 3 values (type, number, flags)
+- `interrupt-controller`: Empty property indicating this node IS an interrupt controller
+- `reg`: Two MMIO regions:
+  - Distributor at 0x08000000 (64 KB) - configures global interrupt routing
+  - Redistributor at 0x080A0000 (1 MB) - per-CPU interrupt handling
 
 #### Understanding Interrupt Specifiers
 
@@ -786,6 +873,35 @@ interrupts = <type number flags>;
 | **number** | 0-N | Interrupt number within category |
 | **flags** | Trigger type | How the interrupt is signaled |
 
+**GIC Interrupt Types Explained**
+
+The GIC organizes interrupts into three categories with distinct IRQ number ranges:
+
+```
+IRQ Numbers:
+┌─────────────────────────────────────────────────────────────────┐
+│  0-15: SGI (Software Generated Interrupts)                      │
+│        - Triggered by software (inter-processor communication)  │
+│        - Each CPU has its own set                               │
+├─────────────────────────────────────────────────────────────────┤
+│  16-31: PPI (Private Peripheral Interrupts)                     │
+│        - Per-CPU hardware interrupts (timers, PMU)              │
+│        - Each CPU has its own set                               │
+├─────────────────────────────────────────────────────────────────┤
+│  32-1019: SPI (Shared Peripheral Interrupts)                    │
+│        - Device interrupts (UART, disk, network)                │
+│        - Shared across all CPUs                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**The Confusing Part: Device Tree uses relative numbering!**
+
+In Device Tree, interrupt numbers are relative to their category:
+- SPI 0 in DT = actual IRQ 32
+- PPI 0 in DT = actual IRQ 16
+
+This is why you'll see conversions like `actual_irq = dt_number + 32` for SPIs.
+
 **Trigger flags:**
 | Value | Meaning |
 |-------|---------|
@@ -794,7 +910,7 @@ interrupts = <type number flags>;
 | 4 | Level triggered, active high |
 | 8 | Level triggered, active low |
 
-Example: UART at SPI 1, level-triggered active high:
+**Example: UART at SPI 1, level-triggered active high:**
 ```dts
 interrupts = <0 1 4>;
 //            │ │ └── Level triggered, active high
@@ -802,13 +918,15 @@ interrupts = <0 1 4>;
 //            └────── Type 0 = SPI
 ```
 
-The timer uses PPIs (per-CPU interrupts):
+**Example: Timer PPIs (per-CPU interrupts):**
 ```dts
-interrupts = <1 13 0x04>,  // PPI 13 (actual = 16 + 13 = 29)
-             <1 14 0x04>,  // PPI 14 (actual = 16 + 14 = 30)
-             <1 11 0x04>,  // PPI 11 (actual = 16 + 11 = 27)
-             <1 10 0x04>;  // PPI 10 (actual = 16 + 10 = 26)
+interrupts = <1 13 0x04>,  // PPI 13 (actual = 16 + 13 = 29) - Secure physical
+             <1 14 0x04>,  // PPI 14 (actual = 16 + 14 = 30) - Non-secure physical
+             <1 11 0x04>,  // PPI 11 (actual = 16 + 11 = 27) - Virtual
+             <1 10 0x04>;  // PPI 10 (actual = 16 + 10 = 26) - Hypervisor
 ```
+
+PPIs make sense for timers because each CPU has its own timer—the interrupt is private to that CPU.
 
 #### Timer Node
 
@@ -1112,6 +1230,19 @@ echo "=========================================="
 exec /bin/sh
 ```
 
+**What are these filesystems?**
+
+| Filesystem | Mount Point | Purpose |
+|------------|-------------|---------|
+| **procfs** | `/proc` | Virtual filesystem exposing kernel/process info. `/proc/cpuinfo`, `/proc/meminfo`, `/proc/[pid]/` for each process. |
+| **sysfs** | `/sys` | Exposes device/driver hierarchy. Used by udev, device management tools. |
+| **devtmpfs** | `/dev` | Auto-populated device nodes. The kernel creates entries like `/dev/ttyAMA0` automatically. |
+
+These aren't real filesystems with files on disk—they're virtual interfaces to kernel data structures. Many commands rely on them:
+- `ps` reads `/proc` to list processes
+- `uname -r` reads `/proc/sys/kernel/osrelease`
+- `poweroff` talks to `/sys/power/state`
+
 Make it executable:
 ```bash
 chmod +x initramfs/init
@@ -1119,7 +1250,23 @@ chmod +x initramfs/init
 
 ### Device Nodes
 
-Linux needs certain device files in `/dev`. With `devtmpfs`, the kernel creates them automatically. But for very early boot (before mounting devtmpfs), we might need:
+Linux accesses hardware through **device files** in `/dev`. These special files let you read/write devices like files:
+
+```bash
+echo "Hello" > /dev/ttyAMA0   # Write to serial port
+cat /dev/urandom | head -c 16 # Read random bytes
+```
+
+**What is devtmpfs?**
+
+In the old days, device files were created manually with `mknod`. Modern Linux uses **devtmpfs**—a virtual filesystem where the kernel automatically creates device nodes when devices are detected:
+
+```bash
+mount -t devtmpfs devtmpfs /dev
+# Now /dev/ttyAMA0, /dev/null, etc. appear automatically!
+```
+
+For very early boot (before mounting devtmpfs), you might need a minimal `/dev/console` for kernel messages:
 
 ```bash
 # Create console device (for kernel messages)
@@ -1129,7 +1276,11 @@ sudo mknod initramfs/dev/console c 5 1
 sudo mknod initramfs/dev/null c 1 3
 ```
 
-The `c` means character device. The numbers are major and minor device numbers.
+The arguments to `mknod`:
+- `c` = character device (as opposed to `b` for block device)
+- `5 1` = major and minor device numbers (console is major 5, minor 1)
+
+Device numbers are standardized—see `Documentation/admin-guide/devices.txt` in the kernel source.
 
 ### Creating the CPIO Archive
 
@@ -1253,13 +1404,14 @@ This module handles loading and booting Linux kernels on ARM64.
 """
 
 from .kernel import KernelImage, KernelError
-from .dtb import DeviceTreeGenerator
+from .dtb import DeviceTreeGenerator, DTBConfig
 from .loader import BootInfo, BootLoader
 
 __all__ = [
     "KernelImage",
     "KernelError",
     "DeviceTreeGenerator",
+    "DTBConfig",
     "BootInfo",
     "BootLoader",
 ]
@@ -1370,10 +1522,15 @@ class KernelImage:
                 f"(expected 0x{ARM64_MAGIC:08x} 'ARM\\x64')"
             )
 
-        # Sanity check text_offset
+        # Handle text_offset = 0
+        # When text_offset is 0 and flags bit 3 is set, the kernel
+        # can be loaded at any address. We use 0 (load at RAM base).
+        # If flags bit 3 is not set, fall back to the default 512KB offset.
         if text_offset == 0:
-            # Some kernels use 0 to mean "use default"
-            text_offset = 0x80000  # 512 KB default
+            if flags & 0x8:  # Bit 3 = physical placement independent
+                text_offset = 0  # Can load at RAM base
+            else:
+                text_offset = 0x80000  # 512 KB default
 
         # Sanity check image_size
         if image_size == 0:
@@ -1548,14 +1705,25 @@ class BootLoader:
             self._memory.write(initrd_addr, initrd_data)
             initrd_size = len(initrd_data)
             next_addr = initrd_addr + initrd_size
+
+            # Debug: verify initramfs was loaded correctly
+            readback = self._memory.read(initrd_addr, 16)
+            magic_str = " ".join(f"{b:02x}" for b in readback[:8])
             print(f"Loaded initramfs at 0x{initrd_addr:08x} ({initrd_size} bytes)")
+            print(f"  First 8 bytes: {magic_str}")
+            if readback[:2] == b'\x1f\x8b':
+                print("  Format: gzip compressed")
+            elif readback[:6] == b'070701':
+                print("  Format: cpio newc (uncompressed)")
+            else:
+                print(f"  Format: unknown (expected 1f 8b for gzip or 070701 for cpio)")
 
         # Place DTB right after initramfs (page-aligned)
         dtb_addr = (next_addr + 0xFFF) & ~0xFFF
         self._memory.write(dtb_addr, dtb_data)
         print(f"Loaded DTB at 0x{dtb_addr:08x} ({len(dtb_data)} bytes)")
 
-        return BootInfo(
+        boot_info = BootInfo(
             kernel_addr=kernel_addr,
             kernel_size=len(kernel.data),
             initrd_addr=initrd_addr if initrd_size > 0 else 0,
@@ -1563,6 +1731,14 @@ class BootLoader:
             dtb_addr=dtb_addr,
             dtb_size=len(dtb_data),
         )
+
+        # Final verification: check that memory at initrd_addr contains expected data
+        if initrd_size > 0:
+            verify_bytes = self._memory.read(boot_info.initrd_addr, 16)
+            print(f"Verification: memory at 0x{boot_info.initrd_addr:08x} = "
+                  f"{' '.join(f'{b:02x}' for b in verify_bytes[:8])}")
+
+        return boot_info
 
     def setup_vcpu(self, vcpu, boot_info: BootInfo) -> None:
         """
@@ -1572,7 +1748,11 @@ class BootLoader:
         - x0 = DTB address (physical)
         - x1, x2, x3 = 0 (reserved)
         - PC = kernel entry point (physical)
-        - PSTATE = EL1h with all exceptions masked
+        - PSTATE = EL1h with interrupts masked
+
+        Note: We also set VBAR_EL1 and SP - while the kernel manages its own
+        exception vectors and stack, having valid initial values helps if
+        an exception occurs very early.
 
         Args:
             vcpu: The VCPU to configure
@@ -1592,16 +1772,30 @@ class BootLoader:
         # PSTATE = EL1h with all exceptions masked
         # This is required by the ARM64 Linux boot protocol
         pstate = (
-            registers.PSTATE_MODE_EL1H |  # EL1, using SP_EL1
-            registers.PSTATE_D |           # Mask Debug exceptions
-            registers.PSTATE_A |           # Mask SError
-            registers.PSTATE_I |           # Mask IRQ
-            registers.PSTATE_F             # Mask FIQ
+            registers.PSTATE_MODE_EL1H  # EL1, using SP_EL1
+            | registers.PSTATE_D  # Mask Debug exceptions
+            | registers.PSTATE_A  # Mask SError
+            | registers.PSTATE_I  # Mask IRQ
+            | registers.PSTATE_F  # Mask FIQ
         )
         vcpu.set_pstate(pstate)
 
-        print(f"vCPU configured: PC=0x{boot_info.kernel_addr:08x}, "
-              f"x0(DTB)=0x{boot_info.dtb_addr:08x}")
+        # Set up VBAR_EL1 and SP for early exception handling.
+        # The kernel will update these later, but having valid values
+        # helps if an exception occurs very early.
+        vectors_phys = boot_info.kernel_addr + 0x10800
+        vcpu.set_register(registers.VBAR_EL1, vectors_phys)
+
+        stack_phys = boot_info.dtb_addr + boot_info.dtb_size
+        stack_phys = (stack_phys + 0xFFF) & ~0xFFF  # Page align
+        stack_phys += 0x10000  # Add 64KB for stack
+        vcpu.set_sp(stack_phys)
+
+        print(
+            f"vCPU configured: PC=0x{boot_info.kernel_addr:08x}, "
+            f"x0(DTB)=0x{boot_info.dtb_addr:08x}, "
+            f"VBAR=0x{vectors_phys:08x}, SP=0x{stack_phys:08x}"
+        )
 ```
 
 ### Device Tree Generator
@@ -1910,24 +2104,23 @@ Now let's add the `god boot` command. Update `src/god/cli.py`:
 def boot_linux(
     kernel: str = typer.Argument(..., help="Path to kernel Image"),
     initrd: str = typer.Option(
-        None,
-        "--initrd", "-i",
-        help="Path to initramfs (cpio or cpio.gz)"
+        None, "--initrd", "-i", help="Path to initramfs (cpio or cpio.gz)"
     ),
     cmdline: str = typer.Option(
         "console=ttyAMA0 earlycon=pl011,0x09000000",
         "--cmdline", "-c",
-        help="Kernel command line"
+        help="Kernel command line",
     ),
-    ram_mb: int = typer.Option(
-        1024,
-        "--ram", "-r",
-        help="RAM size in megabytes"
-    ),
+    ram_mb: int = typer.Option(1024, "--ram", "-r", help="RAM size in megabytes"),
     dtb: str = typer.Option(
         None,
         "--dtb", "-d",
-        help="Path to custom DTB file (optional, generates one if not provided)"
+        help="Path to custom DTB file (optional, generates one if not provided)",
+    ),
+    debug: bool = typer.Option(
+        False,
+        "--debug",
+        help="Show debug output (MMIO accesses, exit stats)",
     ),
 ):
     """
@@ -1941,11 +2134,15 @@ def boot_linux(
         god boot Image -i rootfs.cpio.gz -c "console=ttyAMA0 debug"
         god boot Image --dtb custom.dtb --ram 2048
     """
-    from god.kvm.system import KVMSystem, KVMError
-    from god.vm.vm import VirtualMachine, VMError
-    from god.vcpu.runner import VMRunner, RunnerError
-    from god.devices import DeviceRegistry, PL011UART
+    from pathlib import Path
+
     from god.boot import BootLoader, DeviceTreeGenerator, DTBConfig, KernelError
+    from god.boot.kernel import KernelImage
+    from god.devices import DeviceRegistry, PL011UART
+    from god.kvm.system import KVMError, KVMSystem
+    from god.vcpu.runner import RunnerError, VMRunner
+    from god.vm.layout import RAM_BASE
+    from god.vm.vm import VirtualMachine, VMError
 
     ram_bytes = ram_mb * 1024 * 1024
 
@@ -1980,23 +2177,17 @@ def boot_linux(
                 else:
                     # Generate DTB (we need to know initrd location first,
                     # so we do a two-pass approach)
-                    # First, load kernel to get its size
-                    from god.boot.kernel import KernelImage
-                    from god.vm.layout import RAM_BASE
-
                     kernel_img = KernelImage.load(kernel)
                     kernel_addr = RAM_BASE + kernel_img.text_offset
 
-                    # Place initramfs at 128MB offset into RAM
-                    # This avoids early kernel memory allocations that could corrupt it
+                    # Place initrd high in RAM (128MB offset) to avoid conflicts
                     initrd_addr = RAM_BASE + (128 * 1024 * 1024)
-                    initrd_addr = (initrd_addr + 0xFFF) & ~0xFFF  # Page align
+                    initrd_addr = (initrd_addr + 0xFFF) & ~0xFFF
 
                     # Calculate initrd end if we have one
                     initrd_start = 0
                     initrd_end = 0
                     if initrd:
-                        from pathlib import Path
                         initrd_size = Path(initrd).stat().st_size
                         initrd_start = initrd_addr
                         initrd_end = initrd_addr + initrd_size
@@ -2011,6 +2202,9 @@ def boot_linux(
                     )
                     dtb_data = dtb_gen.generate(dtb_config)
                     print("Generated Device Tree")
+                    if initrd:
+                        print(f"  DTB initrd_start=0x{initrd_start:08x}")
+                        print(f"  DTB initrd_end=0x{initrd_end:08x}")
 
                 # Load everything
                 boot_info = loader.load(
@@ -2028,8 +2222,8 @@ def boot_linux(
                 print("=" * 60)
                 print()
 
-                # Run!
-                stats = runner.run(max_exits=10_000_000, quiet=True)
+                # Run! Use quiet=True unless debug mode
+                stats = runner.run(max_exits=10_000_000, quiet=not debug)
 
                 print()
                 print("=" * 60)
@@ -2075,8 +2269,11 @@ This module handles downloading, configuring, and building the Linux kernel.
 Built artifacts are cached to avoid rebuilding.
 """
 
-import subprocess
+import os
 import shutil
+import subprocess
+import tarfile
+import urllib.request
 from pathlib import Path
 
 
@@ -2091,7 +2288,8 @@ class KernelBuilder:
         image_path = builder.build()
     """
 
-    KERNEL_GIT = "https://github.com/torvalds/linux.git"
+    # Download tarball instead of git clone - much smaller and faster
+    KERNEL_TARBALL_URL = "https://github.com/torvalds/linux/archive/refs/tags/v{version}.tar.gz"
 
     def __init__(self, work_dir: str | Path = "./build"):
         """
@@ -2107,96 +2305,152 @@ class KernelBuilder:
 
     def download(self, version: str = "6.12") -> None:
         """
-        Download kernel source.
+        Download kernel source as a tarball.
+
+        Using a tarball instead of git clone because:
+        - No git history = smaller download (~200MB vs ~300MB+)
+        - Faster extraction than git checkout
+        - We don't need version control for building
 
         Args:
-            version: Kernel version tag (e.g., "6.12", "6.6.10")
+            version: Kernel version (e.g., "6.12", "6.6.10")
         """
         if self.source_dir.exists():
             print(f"Kernel source already exists at {self.source_dir}")
             return
 
-        print(f"Cloning Linux kernel v{version}...")
-        subprocess.run(
-            [
-                "git", "clone",
-                "--depth=1",
-                f"--branch=v{version}",
-                self.KERNEL_GIT,
-                str(self.source_dir),
-            ],
-            check=True,
-        )
-        print("Clone complete")
+        tarball_path = self.work_dir / f"linux-{version}.tar.gz"
+        url = self.KERNEL_TARBALL_URL.format(version=version)
+
+        # Download the tarball
+        if not tarball_path.exists():
+            print(f"Downloading Linux kernel v{version}...")
+            print(f"  URL: {url}")
+
+            def report_progress(block_num, block_size, total_size):
+                downloaded = block_num * block_size
+                if total_size > 0:
+                    percent = min(100, downloaded * 100 // total_size)
+                    mb_downloaded = downloaded / (1024 * 1024)
+                    mb_total = total_size / (1024 * 1024)
+                    print(f"\r  Progress: {percent}% ({mb_downloaded:.1f}/{mb_total:.1f} MB)",
+                          end="", flush=True)
+
+            urllib.request.urlretrieve(url, tarball_path, reporthook=report_progress)
+            print()  # Newline after progress
+            print("Download complete")
+        else:
+            print(f"Using cached tarball: {tarball_path}")
+
+        # Extract the tarball
+        print("Extracting kernel source...")
+        with tarfile.open(tarball_path, "r:gz") as tar:
+            tar.extractall(path=self.work_dir)
+
+        # GitHub tarballs extract to linux-{version}/, rename to linux/
+        extracted_dir = self.work_dir / f"linux-{version}"
+        if extracted_dir.exists():
+            shutil.move(str(extracted_dir), str(self.source_dir))
+
+        print(f"Kernel source ready at {self.source_dir}")
 
     def configure(self, minimal: bool = True) -> None:
         """
         Configure the kernel.
 
         Args:
-            minimal: If True, create a minimal config for our VMM
+            minimal: If True, create a minimal config for our VMM (recommended)
         """
         print("Configuring kernel...")
 
-        # Start with defconfig
-        subprocess.run(
-            ["make", "ARCH=arm64", "defconfig"],
-            cwd=self.source_dir,
-            check=True,
-        )
-
         if minimal:
-            # Apply our minimal config tweaks
-            self._apply_minimal_config()
+            # Start with tinyconfig - absolute minimum kernel
+            subprocess.run(
+                ["make", "ARCH=arm64", "tinyconfig"],
+                cwd=self.source_dir,
+                check=True,
+            )
+            self._apply_vmm_config()
+        else:
+            # Full defconfig - includes many drivers we don't need
+            subprocess.run(
+                ["make", "ARCH=arm64", "defconfig"],
+                cwd=self.source_dir,
+                check=True,
+            )
 
         print("Configuration complete")
 
-    def _apply_minimal_config(self) -> None:
-        """Apply minimal configuration for fast boot."""
+    def _apply_vmm_config(self) -> None:
+        """
+        Apply VMM-specific configuration on top of tinyconfig.
+
+        tinyconfig gives us the smallest possible kernel, but it's too minimal.
+        We enable only what our VMM needs.
+        """
         config_path = self.source_dir / ".config"
 
-        # Read current config
-        with open(config_path) as f:
-            config = f.read()
+        vmm_config = """
+# 64-bit kernel
+CONFIG_64BIT=y
+CONFIG_ARM64=y
+CONFIG_ARM64_VA_BITS_48=y
+CONFIG_ARM64_VA_BITS=48
 
-        # Options to enable
-        enable = [
-            "CONFIG_SERIAL_AMBA_PL011=y",
-            "CONFIG_SERIAL_AMBA_PL011_CONSOLE=y",
-            "CONFIG_ARM_GIC_V3=y",
-            "CONFIG_ARM_ARCH_TIMER=y",
-            "CONFIG_BLK_DEV_INITRD=y",
-            "CONFIG_VIRTIO=y",
-            "CONFIG_VIRTIO_MMIO=y",
-            "CONFIG_VIRTIO_BLK=y",
-            "CONFIG_VIRTIO_CONSOLE=y",
-            "CONFIG_EARLY_PRINTK=y",
-        ]
+# Basic kernel features
+CONFIG_PRINTK=y
+CONFIG_BUG=y
+CONFIG_FUTEX=y
+CONFIG_MULTIUSER=y
 
-        # Options to disable (speed up boot)
-        disable = [
-            "CONFIG_MODULES",  # No loadable modules
-            "CONFIG_NETWORK_FILESYSTEMS",
-            "CONFIG_NFS_FS",
-            "CONFIG_CIFS",
-        ]
+# Console/TTY support
+CONFIG_TTY=y
+CONFIG_VT=y
+CONFIG_VT_CONSOLE=y
+CONFIG_UNIX98_PTYS=y
 
-        # Apply changes
-        for opt in enable:
-            key = opt.split("=")[0]
-            # Remove any existing setting
-            config = "\n".join(
-                line for line in config.split("\n")
-                if not line.startswith(key)
-            )
-            config += f"\n{opt}"
+# Serial console - PL011 UART
+CONFIG_SERIAL_CORE=y
+CONFIG_SERIAL_CORE_CONSOLE=y
+CONFIG_SERIAL_AMBA_PL011=y
+CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
+CONFIG_SERIAL_EARLYCON=y
 
-        for opt in disable:
-            config = config.replace(f"{opt}=y", f"# {opt} is not set")
-            config = config.replace(f"{opt}=m", f"# {opt} is not set")
+# Interrupt controller - GICv3
+CONFIG_IRQCHIP=y
+CONFIG_ARM_GIC=y
+CONFIG_ARM_GIC_V3=y
 
-        with open(config_path, "w") as f:
-            f.write(config)
+# Timer - ARM architected timer
+CONFIG_ARM_ARCH_TIMER=y
+CONFIG_GENERIC_CLOCKEVENTS=y
+
+# Initramfs support
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+CONFIG_INITRAMFS_SOURCE=""
+
+# Basic filesystem support
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
+
+# Required for /bin/sh to work
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+
+# PSCI for CPU control
+CONFIG_ARM_PSCI_FW=y
+
+# Disable things that slow down boot
+# CONFIG_MODULES is not set
+# CONFIG_NETWORK is not set
+# CONFIG_BLOCK is not set
+"""
+        with open(config_path, "a") as f:
+            f.write(vmm_config)
 
         # Run olddefconfig to resolve dependencies
         subprocess.run(
@@ -2217,9 +2471,6 @@ class KernelBuilder:
             return self.image_path
 
         print("Building kernel (this may take a while)...")
-
-        # Determine parallelism
-        import os
         jobs = os.cpu_count() or 4
 
         subprocess.run(
@@ -2232,11 +2483,18 @@ class KernelBuilder:
         return self.image_path
 
     def clean(self) -> None:
-        """Remove built artifacts."""
+        """Remove built artifacts but keep .config."""
         subprocess.run(
             ["make", "ARCH=arm64", "clean"],
             cwd=self.source_dir,
             check=True,
+        )
+
+    def mrproper(self) -> None:
+        """Full clean - removes everything including .config."""
+        subprocess.run(
+            ["make", "ARCH=arm64", "mrproper"],
+            cwd=self.source_dir,
         )
 ```
 
@@ -2250,6 +2508,7 @@ This module handles downloading, configuring, and building BusyBox
 for use in initramfs.
 """
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -2265,7 +2524,8 @@ class BusyBoxBuilder:
         busybox_path = builder.build()
     """
 
-    BUSYBOX_GIT = "https://git.busybox.net/busybox"
+    # Use GitHub mirror - the official git.busybox.net has SSL issues
+    BUSYBOX_GIT = "https://github.com/mirror/busybox.git"
 
     def __init__(self, work_dir: str | Path = "./build"):
         """
@@ -2307,33 +2567,68 @@ class BusyBoxBuilder:
         """Configure BusyBox for static linking."""
         print("Configuring BusyBox...")
 
-        # Start with default config
+        # Start with minimal config, then enable what we need
         subprocess.run(
-            ["make", "defconfig"],
+            ["make", "allnoconfig"],
             cwd=self.source_dir,
             check=True,
         )
 
-        # Enable static linking
         config_path = self.source_dir / ".config"
+
+        # Options to enable for a minimal but usable system
+        enable_options = [
+            "CONFIG_STATIC",
+            "CONFIG_ASH",
+            "CONFIG_SH_IS_ASH",
+            "CONFIG_FEATURE_EDITING",
+            "CONFIG_CAT",
+            "CONFIG_ECHO",
+            "CONFIG_LS",
+            "CONFIG_MKDIR",
+            "CONFIG_RM",
+            "CONFIG_CP",
+            "CONFIG_MV",
+            "CONFIG_LN",
+            "CONFIG_CHMOD",
+            "CONFIG_PWD",
+            "CONFIG_SLEEP",
+            "CONFIG_TRUE",
+            "CONFIG_FALSE",
+            "CONFIG_TEST",
+            "CONFIG_PRINTF",
+            "CONFIG_PS",
+            "CONFIG_KILL",
+            "CONFIG_DATE",
+            "CONFIG_UNAME",
+            "CONFIG_HOSTNAME",
+            "CONFIG_DMESG",
+            "CONFIG_ENV",
+            "CONFIG_ID",
+            "CONFIG_INIT",
+            "CONFIG_MOUNT",
+            "CONFIG_UMOUNT",
+            "CONFIG_POWEROFF",
+            "CONFIG_REBOOT",
+            "CONFIG_HALT",
+        ]
+
         with open(config_path) as f:
             config = f.read()
 
-        # Enable static linking (critical!)
-        config = config.replace(
-            "# CONFIG_STATIC is not set",
-            "CONFIG_STATIC=y"
-        )
+        for opt in enable_options:
+            config = config.replace(f"# {opt} is not set", f"{opt}=y")
 
         with open(config_path, "w") as f:
             f.write(config)
 
         # Resolve dependencies
-        subprocess.run(
+        proc = subprocess.run(
             ["make", "oldconfig"],
             cwd=self.source_dir,
-            input=b"\n" * 100,  # Accept defaults
-            check=True,
+            input="\n" * 500,  # Accept defaults
+            text=True,
+            capture_output=True,
         )
 
         print("Configuration complete")
@@ -2350,8 +2645,6 @@ class BusyBoxBuilder:
             return self.binary_path
 
         print("Building BusyBox...")
-
-        import os
         jobs = os.cpu_count() or 4
 
         subprocess.run(
@@ -2393,6 +2686,7 @@ This module creates CPIO archives for use as initramfs.
 """
 
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -2414,9 +2708,9 @@ class InitramfsBuilder:
 #!/bin/sh
 
 # Mount essential filesystems
+mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
 
 # Display banner
 echo "=========================================="
@@ -2424,9 +2718,12 @@ echo "  Welcome to our VMM!"
 echo "  Linux $(uname -r) on $(uname -m)"
 echo "=========================================="
 echo
+echo "Boot successful! System running."
+echo "Halting now..."
+echo
 
-# Start shell
-exec /bin/sh
+# Signal success and halt - this tells PSCI to power off
+poweroff -f
 """
 
     def __init__(self, work_dir: str | Path = "./build"):
@@ -2447,7 +2744,6 @@ exec /bin/sh
 
         # Remove old if exists
         if self.rootfs_dir.exists():
-            import shutil
             shutil.rmtree(self.rootfs_dir)
 
         # Create directories
@@ -2478,7 +2774,6 @@ exec /bin/sh
         print("Installing BusyBox...")
 
         # Copy busybox binary
-        import shutil
         dest = self.rootfs_dir / "bin" / "busybox"
         shutil.copy2(busybox_path, dest)
         dest.chmod(0o755)
