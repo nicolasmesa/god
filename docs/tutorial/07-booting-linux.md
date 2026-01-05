@@ -329,11 +329,14 @@ In menuconfig, navigate and disable unnecessary options:
 - **Device Drivers** → Disable most (keep Serial, Virtio)
 - **File systems** → Keep only what's needed for initramfs
 
-Or use our automated setup (we'll create this script later):
+Or use our automated setup (implemented later in this chapter in the "Build Automation" section):
 
 ```bash
-# We'll create this script to automate kernel config
-python -m god.build kernel --configure
+# Download, configure, and build in one command
+god build kernel
+
+# Or just configure without building
+god build kernel --configure
 ```
 
 ### Building the Kernel
@@ -2205,6 +2208,17 @@ def boot_linux(
                     if initrd:
                         print(f"  DTB initrd_start=0x{initrd_start:08x}")
                         print(f"  DTB initrd_end=0x{initrd_end:08x}")
+                        # Verify DTB by parsing it back
+                        import fdt
+                        dt = fdt.parse_dtb(dtb_data)
+                        chosen = dt.get_node("/chosen")
+                        if chosen:
+                            start_prop = chosen.get_property("linux,initrd-start")
+                            end_prop = chosen.get_property("linux,initrd-end")
+                            if start_prop and end_prop:
+                                start_val = (start_prop.data[0] << 32) | start_prop.data[1]
+                                end_val = (end_prop.data[0] << 32) | end_prop.data[1]
+                                print(f"  Parsed back from DTB: start=0x{start_val:08x}, end=0x{end_val:08x}")
 
                 # Load everything
                 boot_info = loader.load(
@@ -2212,6 +2226,15 @@ def boot_linux(
                     initrd_path=initrd,
                     dtb_data=dtb_data,
                 )
+
+                # Verify DTB addresses match actual load addresses
+                if initrd and not dtb:
+                    if boot_info.initrd_addr != initrd_start:
+                        print(f"WARNING: DTB initrd_start (0x{initrd_start:08x}) != "
+                              f"actual load addr (0x{boot_info.initrd_addr:08x})")
+                    if boot_info.initrd_end != initrd_end:
+                        print(f"WARNING: DTB initrd_end (0x{initrd_end:08x}) != "
+                              f"actual end addr (0x{boot_info.initrd_end:08x})")
 
                 # Set up vCPU for boot
                 loader.setup_vcpu(vcpu, boot_info)
@@ -2491,11 +2514,21 @@ CONFIG_ARM_PSCI_FW=y
         )
 
     def mrproper(self) -> None:
-        """Full clean - removes everything including .config."""
-        subprocess.run(
+        """
+        Full clean - removes everything including .config and generated files.
+
+        Use this when the build is corrupted (e.g., interrupted build left
+        broken .cmd files). After mrproper, you must run configure() again.
+        """
+        print("Running mrproper (full clean)...")
+        # Don't check=True - mrproper can fail on edge cases but still clean enough
+        result = subprocess.run(
             ["make", "ARCH=arm64", "mrproper"],
             cwd=self.source_dir,
         )
+        if result.returncode != 0:
+            print("Warning: mrproper had errors but cleaned enough to proceed")
+        print("Clean complete.")
 ```
 
 Create `src/god/build/busybox.py`:
@@ -2899,6 +2932,27 @@ def build_kernel(
         print(f"\nKernel built successfully: {image_path}")
 
 
+@build_app.command("kernel-clean")
+def build_kernel_clean(
+    work_dir: str = typer.Option("./build", "--dir", "-d", help="Build directory"),
+    full: bool = typer.Option(
+        False, "--full", "-f", help="Full clean (mrproper) - removes .config too"
+    ),
+):
+    """
+    Clean kernel build artifacts.
+
+    Use --full for mrproper (needed if build is corrupted).
+    """
+    from god.build import KernelBuilder
+
+    builder = KernelBuilder(work_dir)
+    if full:
+        builder.mrproper()
+    else:
+        builder.clean()
+
+
 @build_app.command("busybox")
 def build_busybox(
     version: str = typer.Option("1_36_1", "--version", "-v", help="BusyBox version"),
@@ -3065,27 +3119,251 @@ Boot debugging can be tricky because failures often happen before any console ou
 
 ### Adding Register Dump on Timeout
 
-When the vCPU hangs, you need to see what's happening. Add system register reading to your VCPU class:
+When the vCPU hangs, you need to see what's happening. First, add system register definitions to `src/god/vcpu/registers.py`:
 
 ```python
-# In src/god/vcpu/registers.py, add system register definitions:
+# ============================================================================
+# System Registers
+# ============================================================================
+# System registers are accessed via a different encoding than core registers.
+# Format: KVM_REG_ARM64 | size | KVM_REG_ARM64_SYSREG | (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
+#
+# For ESR_EL1 (Exception Syndrome Register):
+#   op0=3, op1=0, crn=5, crm=2, op2=0
+# For SCTLR_EL1 (System Control Register):
+#   op0=3, op1=0, crn=1, crm=0, op2=0
+
 KVM_REG_ARM64_SYSREG = 0x0013 << 16
 
 def _sysreg(op0: int, op1: int, crn: int, crm: int, op2: int) -> int:
     """Create a system register ID."""
     return (
-        KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG
-        | (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
+        KVM_REG_ARM64
+        | KVM_REG_SIZE_U64
+        | KVM_REG_ARM64_SYSREG
+        | (op0 << 14)
+        | (op1 << 11)
+        | (crn << 7)
+        | (crm << 3)
+        | op2
     )
 
-ESR_EL1 = _sysreg(3, 0, 5, 2, 0)   # Exception Syndrome Register
-FAR_EL1 = _sysreg(3, 0, 6, 0, 0)   # Fault Address Register
-ELR_EL1 = _sysreg(3, 0, 4, 0, 1)   # Exception Link Register
-VBAR_EL1 = _sysreg(3, 0, 12, 0, 0) # Vector Base Address Register
-SCTLR_EL1 = _sysreg(3, 0, 1, 0, 0) # System Control Register
+# Exception Syndrome Register - tells us what caused an exception
+ESR_EL1 = _sysreg(3, 0, 5, 2, 0)
+
+# System Control Register - controls MMU, caches, etc.
+SCTLR_EL1 = _sysreg(3, 0, 1, 0, 0)
+
+# Fault Address Register - address that caused a data/instruction abort
+FAR_EL1 = _sysreg(3, 0, 6, 0, 0)
+
+# Exception Link Register - return address after exception
+ELR_EL1 = _sysreg(3, 0, 4, 0, 1)
+
+# Vector Base Address Register - where exception vectors are
+VBAR_EL1 = _sysreg(3, 0, 12, 0, 0)
 ```
 
-Then add a `dump_registers()` method to your VCPU that reads and prints these registers. When debugging, you can set a timeout and dump registers if the vCPU doesn't make progress.
+Now add the `dump_registers()` method to your `VCPU` class in `src/god/vcpu/vcpu.py`:
+
+```python
+def dump_registers(self):
+    """Print all general-purpose registers (for debugging)."""
+    print("vCPU Registers:")
+    print("-" * 50)
+
+    # General-purpose registers in rows of 4
+    for i in range(0, 31, 4):
+        parts = []
+        for j in range(4):
+            if i + j < 31:
+                reg_id = registers.X_REGISTERS[i + j]
+                value = self.get_register(reg_id)
+                parts.append(f"x{i+j:2d}=0x{value:016x}")
+        print("  " + "  ".join(parts))
+
+    # Special registers
+    print()
+    print(f"  sp     = 0x{self.get_sp():016x}")
+    print(f"  pc     = 0x{self.get_pc():016x}")
+    print(f"  pstate = 0x{self.get_pstate():016x}")
+
+    # System registers (for exception debugging)
+    print()
+    print("System Registers:")
+    try:
+        # VBAR_EL1 should be readable
+        vbar = self.get_register(registers.VBAR_EL1)
+        print(f"  VBAR_EL1  = 0x{vbar:016x}  (Exception Vector Base)")
+    except Exception as e:
+        print(f"  VBAR_EL1  = (read failed: {e})")
+
+    try:
+        esr = self.get_register(registers.ESR_EL1)
+        far = self.get_register(registers.FAR_EL1)
+        elr = self.get_register(registers.ELR_EL1)
+        sctlr = self.get_register(registers.SCTLR_EL1)
+        print(f"  ESR_EL1   = 0x{esr:016x}  (Exception Syndrome)")
+        print(f"  FAR_EL1   = 0x{far:016x}  (Fault Address)")
+        print(f"  ELR_EL1   = 0x{elr:016x}  (Exception Return)")
+        print(f"  SCTLR_EL1 = 0x{sctlr:016x}  (System Control)")
+
+        # Decode ESR_EL1
+        ec = (esr >> 26) & 0x3F  # Exception Class
+        ec_names = {
+            0x00: "Unknown",
+            0x01: "WFI/WFE",
+            0x15: "SVC in AArch64",
+            0x16: "HVC in AArch64",
+            0x17: "SMC in AArch64",
+            0x20: "Instruction Abort (lower EL)",
+            0x21: "Instruction Abort (same EL)",
+            0x22: "PC alignment",
+            0x24: "Data Abort (lower EL)",
+            0x25: "Data Abort (same EL)",
+            0x26: "SP alignment",
+        }
+        ec_name = ec_names.get(ec, f"Unknown(0x{ec:02x})")
+        print(f"  -> Exception Class: {ec_name}")
+    except Exception as e:
+        print(f"  (Could not read system registers: {e})")
+```
+
+To use this for debugging hangs, add a timeout handler to your `run()` method in `src/god/vcpu/runner.py`. Here's the complete implementation:
+
+```python
+def run(self, max_exits: int = 100000, quiet: bool = False) -> dict:
+    """
+    Run the VM until it halts or hits max_exits.
+
+    The GIC is automatically finalized before the first vCPU runs.
+
+    Args:
+        max_exits: Maximum number of VM exits before giving up.
+        quiet: If True, suppress debug output. Errors are always printed.
+
+    Returns:
+        Dict with execution statistics.
+    """
+    if not self._vcpus:
+        raise RunnerError("No vCPUs created - call create_vcpu() first")
+
+    # Finalize GIC before running
+    if self._gic is not None and not self._gic.finalized:
+        self._gic.finalize()
+
+    stats = {
+        "exits": 0,
+        "hlt": False,
+        "exit_reason": None,
+        "exit_counts": {},
+    }
+
+    vcpu = self._vcpus[0]
+
+    import signal
+    import sys
+
+    # Set up timeout handler to dump registers on hang
+    def timeout_handler(signum, frame):
+        print("\n[TIMEOUT - vCPU appears stuck, dumping registers]")
+        vcpu.dump_registers()
+        sys.exit(1)
+
+    # Enable 5-second timeout when not in quiet mode
+    if not quiet:
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(5)
+
+    for i in range(max_exits):
+        # Run the vCPU - blocks until guest exits
+        exit_reason = vcpu.run()
+
+        # Reset timeout on each successful exit
+        if not quiet:
+            signal.alarm(5)
+
+        # Handle signal interruption (EINTR)
+        if exit_reason == -1:
+            continue
+
+        # Track statistics
+        stats["exits"] += 1
+        exit_name = vcpu.get_exit_reason_name(exit_reason)
+        stats["exit_counts"][exit_name] = (
+            stats["exit_counts"].get(exit_name, 0) + 1
+        )
+        stats["exit_reason"] = exit_name
+
+        # Handle the exit based on its type
+        if exit_reason == KVM_EXIT_HLT:
+            stats["hlt"] = True
+            break
+
+        elif exit_reason == KVM_EXIT_MMIO:
+            self._handle_mmio(vcpu)
+
+        elif exit_reason == KVM_EXIT_SYSTEM_EVENT:
+            # Guest requested shutdown/reset (PSCI)
+            if not quiet:
+                print("\n[Guest requested shutdown/reset]")
+            break
+
+        elif exit_reason == KVM_EXIT_INTERNAL_ERROR:
+            print("\n[KVM internal error]")
+            vcpu.dump_registers()
+            raise RunnerError("KVM internal error")
+
+        elif exit_reason == KVM_EXIT_FAIL_ENTRY:
+            print("\n[Failed to enter guest mode]")
+            vcpu.dump_registers()
+            raise RunnerError("Entry to guest mode failed")
+
+        else:
+            if not quiet:
+                print(f"\n[Unhandled exit: {exit_name}]")
+                vcpu.dump_registers()
+            break
+
+    return stats
+```
+
+The key debugging features:
+
+1. **Timeout handler** (lines 30-34): Uses `signal.SIGALRM` to detect hangs. If the vCPU doesn't produce an exit within 5 seconds, it dumps all registers and exits.
+
+2. **Automatic reset** (lines 45-46): The alarm resets after each successful VM exit, so it only fires if the vCPU is truly stuck in an infinite loop or waiting forever.
+
+3. **Error dumps**: On `KVM_EXIT_INTERNAL_ERROR` (line 76) or `KVM_EXIT_FAIL_ENTRY` (line 81), registers are automatically dumped before raising an exception.
+
+4. **Unhandled exit dumps** (line 87): Any unexpected exit type triggers a register dump so you can see what state the CPU was in.
+
+Example output when debugging a boot hang:
+
+```
+vCPU Registers:
+--------------------------------------------------
+  x 0=0x0000000048080000  x 1=0x0000000040000000  x 2=0x0000000000000000  x 3=0x0000000000000000
+  x 4=0x0000000000000000  x 5=0x0000000000000000  x 6=0x0000000000000000  x 7=0x0000000000000000
+  ...
+
+  sp     = 0x0000000048091000
+  pc     = 0x0000000040000000
+  pstate = 0x00000000000003c5
+
+System Registers:
+  VBAR_EL1  = 0x0000000040010800  (Exception Vector Base)
+  ESR_EL1   = 0x0000000096000045  (Exception Syndrome)
+  FAR_EL1   = 0x0000000009000000  (Fault Address)
+  ELR_EL1   = 0x0000000040001234  (Exception Return)
+  SCTLR_EL1 = 0x0000000030d00800  (System Control)
+  -> Exception Class: Data Abort (same EL)
+```
+
+This tells you:
+- **ESR_EL1** shows a Data Abort (EC=0x25) - the kernel tried to access invalid memory
+- **FAR_EL1** shows the faulting address (0x09000000 = UART) - maybe our UART emulation isn't responding correctly
+- **ELR_EL1** shows where to return after the exception - you can look up this address in the kernel disassembly
 
 ### No Output At All
 
