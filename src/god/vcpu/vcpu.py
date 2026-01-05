@@ -226,6 +226,28 @@ class VCPU:
         """Set the processor state register."""
         self.set_register(registers.PSTATE, value)
 
+    def set_immediate_exit(self, value: bool) -> None:
+        """
+        Set the immediate_exit flag in kvm_run.
+
+        When immediate_exit is set to 1, the next KVM_RUN will return
+        immediately with -EINTR instead of entering guest mode. This is
+        used to interrupt a vCPU that might be blocked in WFI.
+
+        Args:
+            value: True to set immediate_exit, False to clear it.
+        """
+        # immediate_exit is at offset 1 in kvm_run structure:
+        #   offset 0: request_interrupt_window (u8)
+        #   offset 1: immediate_exit (u8)
+        immediate_exit_ptr = ffi.cast("uint8_t *", self._kvm_run + 1)
+        immediate_exit_ptr[0] = 1 if value else 0
+
+    @property
+    def kvm_run_ptr(self):
+        """Get the raw pointer to kvm_run structure (for signal handlers)."""
+        return self._kvm_run
+
     def run(self) -> int:
         """
         Run the vCPU until it exits.

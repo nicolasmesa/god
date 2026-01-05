@@ -246,19 +246,23 @@ class GIC:
         This asserts or deasserts an interrupt line. For level-triggered
         interrupts (most common), you must deassert when the condition clears.
 
-        Interrupt number ranges:
+        Interrupt number ranges (GIC interrupt IDs):
         - 0-15: SGIs (Software Generated Interrupts) - CPU-to-CPU signaling
         - 16-31: PPIs (Private Peripheral Interrupts) - per-CPU (e.g., timer)
         - 32+: SPIs (Shared Peripheral Interrupts) - external devices
 
-        For devices, use SPI numbers: UART is SPI 1 = interrupt 33.
+        For devices, use the full GIC interrupt ID: UART is SPI 1 = IRQ 33.
+
+        NOTE: KVM_IRQ_LINE expects the GSI (SPI number), not the full GIC ID.
+        This method handles the conversion: pass the GIC interrupt ID (e.g., 33)
+        and we'll convert it to the GSI (e.g., 1) for KVM.
 
         Args:
-            irq: The interrupt number (for SPIs: SPI_number + 32).
+            irq: The GIC interrupt number (for SPIs: 32 + SPI_number).
             level: True to assert (raise), False to deassert (lower).
 
         Example:
-            # UART has data, signal the guest
+            # UART has data, signal the guest (IRQ 33 = SPI 1)
             gic.inject_irq(33, level=True)
 
             # Guest read the data, clear the interrupt
@@ -267,14 +271,34 @@ class GIC:
         if not self._finalized:
             raise GICError("GIC not finalized - call finalize() first")
 
+        # ARM KVM_IRQ_LINE uses a specific bit encoding:
+        #   bits 31-24: irq_type (0=SPI via routing, 1=SPI via GIC, 2=PPI)
+        #   bits 23-16: vcpu_index (ignored for SPIs)
+        #   bits 15-0:  irq_id (the actual interrupt number)
+        #
+        # For SPIs (irq >= 32): irq_type=1, irq_id=irq
+        # For PPIs (16-31): irq_type=2, irq_id=irq, vcpu_index matters
+        KVM_ARM_IRQ_TYPE_SPI = 1
+        KVM_ARM_IRQ_TYPE_PPI = 2
+
+        if irq >= 32:
+            # SPI - Shared Peripheral Interrupt
+            encoded_irq = (KVM_ARM_IRQ_TYPE_SPI << 24) | irq
+        elif irq >= 16:
+            # PPI - Private Peripheral Interrupt (per-CPU)
+            encoded_irq = (KVM_ARM_IRQ_TYPE_PPI << 24) | irq
+        else:
+            # SGI - not typically used via KVM_IRQ_LINE
+            encoded_irq = irq
+
         irq_level = ffi.new("struct kvm_irq_level *")
-        irq_level.irq = irq
+        irq_level.irq = encoded_irq
         irq_level.level = 1 if level else 0
 
         result = lib.ioctl(self._vm_fd, KVM_IRQ_LINE, irq_level)
         if result < 0:
             action = "assert" if level else "deassert"
-            raise GICError(f"Failed to {action} IRQ {irq}: errno {get_errno()}")
+            raise GICError(f"Failed to {action} IRQ {irq} (encoded 0x{encoded_irq:08x}): errno {get_errno()}")
 
     @property
     def fd(self) -> int:

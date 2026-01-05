@@ -316,6 +316,11 @@ def boot_linux(
         "--debug",
         help="Show debug output (MMIO accesses, exit stats)",
     ),
+    interactive: bool = typer.Option(
+        True,
+        "--interactive/--no-interactive",
+        help="Enable interactive console (stdin input to guest)",
+    ),
 ):
     """
     Boot a Linux kernel.
@@ -323,10 +328,13 @@ def boot_linux(
     Loads the kernel and optional initramfs into the VM and starts execution.
     A Device Tree is generated automatically unless a custom one is provided.
 
+    By default, interactive mode is enabled, allowing you to type commands
+    in the guest shell. Use --no-interactive for non-interactive boot.
+
     Examples:
         god boot Image --initrd initramfs.cpio
         god boot Image -i rootfs.cpio.gz -c "console=ttyAMA0 debug"
-        god boot Image --dtb custom.dtb --ram 2048
+        god boot Image --dtb custom.dtb --ram 2048 --no-interactive
     """
     from pathlib import Path
 
@@ -438,7 +446,7 @@ def boot_linux(
                 print()
 
                 # Run!
-                stats = runner.run(max_exits=10_000_000, quiet=not debug)
+                stats = runner.run(max_exits=10_000_000, quiet=not debug, interactive=interactive)
 
                 print()
                 print("=" * 60)

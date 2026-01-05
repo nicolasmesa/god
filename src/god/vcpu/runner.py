@@ -10,9 +10,14 @@ The run loop is the heart of the VMM - it's a simple concept:
 4. Handle the exit (emulate device, report error, etc.)
 5. Go back to step 1
 
-Most guest execution is "exit-driven" - the VMM spends most of its time
-waiting for the guest to do something that requires attention.
+For interactive mode, we also monitor stdin for input and inject it into the
+UART for the guest to receive.
 """
+
+import os
+import select
+import signal
+import sys
 
 from god.kvm.constants import (
     KVM_EXIT_HLT,
@@ -23,7 +28,8 @@ from god.kvm.constants import (
 )
 from god.kvm.system import KVMSystem
 from god.vm.vm import VirtualMachine
-from god.devices import DeviceRegistry, MMIOAccess, GIC
+from god.devices import DeviceRegistry, MMIOAccess, GIC, PL011UART
+from god.terminal import TerminalMode
 from .vcpu import VCPU
 from . import registers
 
@@ -39,33 +45,19 @@ class VMRunner:
 
     This class manages the run loop and coordinates between the VM,
     vCPU, and device handlers. It also sets up the GIC (interrupt
-    controller) which is required for the guest to receive interrupts.
+    controller) and handles terminal input for interactive console.
 
     The initialization sequence is:
     1. VMRunner() - creates the GIC (required before vCPUs)
     2. create_vcpu() - creates vCPUs (can call multiple times)
     3. run() - finalizes GIC and starts execution
 
-    The GIC must be created before vCPUs, but finalized after all vCPUs
-    exist. VMRunner handles this automatically.
-
     Usage:
-        runner = VMRunner(vm, kvm)  # GIC created here
-        vcpu0 = runner.create_vcpu()
-        vcpu1 = runner.create_vcpu()  # Multi-vCPU supported
-
-        # Set up initial state
-        vcpu0.set_pc(entry_point)
-        vcpu0.set_sp(stack_top)
-
-        # Load code
+        runner = VMRunner(vm, kvm)
+        vcpu = runner.create_vcpu()
+        vcpu.set_pc(entry_point)
         runner.load_binary("/path/to/binary", entry_point)
-
-        # Run (GIC finalized automatically, then execution starts)
-        stats = runner.run()
-
-        # Inject interrupts
-        runner.gic.inject_irq(33, level=True)
+        stats = runner.run(interactive=True)
     """
 
     def __init__(
@@ -95,12 +87,27 @@ class VMRunner:
         self._devices = devices if devices is not None else DeviceRegistry()
         self._vcpus: list[VCPU] = []
         self._gic: GIC | None = None
+        self._uart: PL011UART | None = None
 
         # Create the GIC (interrupt controller)
         # This must happen before any vCPUs are created.
         if create_gic:
             self._gic = GIC(self._vm.fd)
             self._gic.create()
+
+        # Find UART in device registry and link it to GIC
+        self._setup_uart_gic_link()
+
+    def _setup_uart_gic_link(self) -> None:
+        """Find the UART device and give it a reference to the GIC."""
+        if self._gic is None:
+            return
+
+        for device in self._devices._devices:
+            if isinstance(device, PL011UART):
+                device.set_gic(self._gic)
+                self._uart = device
+                break
 
     @property
     def devices(self) -> DeviceRegistry:
@@ -111,6 +118,11 @@ class VMRunner:
     def gic(self) -> GIC | None:
         """Get the GIC (interrupt controller)."""
         return self._gic
+
+    @property
+    def uart(self) -> PL011UART | None:
+        """Get the UART device (if registered)."""
+        return self._uart
 
     @property
     def vcpus(self) -> list[VCPU]:
@@ -184,7 +196,12 @@ class VMRunner:
 
         return result.handled
 
-    def run(self, max_exits: int = 100000, quiet: bool = False) -> dict:
+    def run(
+        self,
+        max_exits: int = 100000,
+        quiet: bool = False,
+        interactive: bool = False,
+    ) -> dict:
         """
         Run the VM until it halts or hits max_exits.
 
@@ -192,10 +209,11 @@ class VMRunner:
         This ensures all vCPUs are created before GIC finalization.
 
         The run loop:
-        1. Call vcpu.run() - guest executes until something happens
-        2. Check exit_reason to see what happened
-        3. Handle the exit appropriately
-        4. Repeat
+        1. Check for stdin input (if interactive)
+        2. Call vcpu.run() - guest executes until something happens
+        3. Check exit_reason to see what happened
+        4. Handle the exit appropriately
+        5. Repeat
 
         Args:
             max_exits: Maximum number of VM exits before giving up.
@@ -203,6 +221,8 @@ class VMRunner:
                        Default is 100000 (enough for a full boot).
             quiet: If True, suppress debug output for normal operations
                    like MMIO. Errors are always printed.
+            interactive: If True, enable stdin input for the UART console.
+                        This puts the terminal in raw mode.
 
         Returns:
             Dict with execution statistics:
@@ -234,35 +254,104 @@ class VMRunner:
         # Multi-vCPU execution requires threading (future work)
         vcpu = self._vcpus[0]
 
-        import signal
-        import sys
+        # Save original signal handler
+        original_handler = signal.getsignal(signal.SIGALRM)
 
-        # Set up timeout handler to dump registers on hang
-        def timeout_handler(signum, frame):
-            print("\n[TIMEOUT - vCPU appears stuck, dumping registers]")
-            vcpu.dump_registers()
-            sys.exit(1)
+        # Use context manager for terminal mode if interactive
+        if interactive and self._uart is not None:
+            # In interactive mode, we need to periodically interrupt KVM_RUN
+            # so we can check for stdin input. We use SIGALRM with setitimer
+            # to set the immediate_exit flag, which causes KVM_RUN to return.
+            def interactive_signal_handler(signum, frame):
+                # Set immediate_exit to interrupt KVM_RUN
+                vcpu.set_immediate_exit(True)
 
-        if not quiet:
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(5)  # 5 second timeout
+            signal.signal(signal.SIGALRM, interactive_signal_handler)
+            # Set up recurring timer: 100ms interval
+            signal.setitimer(signal.ITIMER_REAL, 0.1, 0.1)
+
+            try:
+                with TerminalMode(sys.stdin) as term:
+                    stats = self._run_loop(vcpu, max_exits, quiet, term)
+            finally:
+                # Restore signal handling
+                signal.setitimer(signal.ITIMER_REAL, 0, 0)  # Disable timer
+                signal.signal(signal.SIGALRM, original_handler)
+        else:
+            # Non-interactive: set up timeout handler for debugging
+            if not quiet:
+                def timeout_handler(signum, frame):
+                    print("\n[TIMEOUT - vCPU appears stuck, dumping registers]")
+                    vcpu.dump_registers()
+                    sys.exit(1)
+
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(5)  # 5 second timeout
+
+            try:
+                stats = self._run_loop(vcpu, max_exits, quiet, None)
+            finally:
+                if not quiet:
+                    signal.alarm(0)  # Cancel timeout
+                    signal.signal(signal.SIGALRM, original_handler)
+
+        return stats
+
+    def _run_loop(
+        self,
+        vcpu: VCPU,
+        max_exits: int,
+        quiet: bool,
+        term: TerminalMode | None,
+    ) -> dict:
+        """
+        The main run loop.
+
+        Args:
+            vcpu: The vCPU to run.
+            max_exits: Maximum exits before stopping.
+            quiet: Suppress debug output.
+            term: Terminal manager for interactive input, or None.
+
+        Returns:
+            Execution statistics dict.
+        """
+        stats = {
+            "exits": 0,
+            "hlt": False,
+            "exit_reason": None,
+            "exit_counts": {},
+        }
+
+        # Get file descriptor for stdin if interactive
+        stdin_fd = term.fd if term else -1
 
         for i in range(max_exits):
-            # Run the vCPU - this blocks until the guest exits
+            # Check for stdin input if interactive
+            # We use select() with timeout=0 for a non-blocking check.
+            # This happens between vCPU runs when we get interrupted by SIGALRM.
+            if term is not None and self._uart is not None:
+                readable, _, _ = select.select([stdin_fd], [], [], 0)
+                if stdin_fd in readable:
+                    data = os.read(stdin_fd, 256)
+                    if data:
+                        self._uart.inject_input(data)
+                # Clear immediate_exit before running
+                # (it may have been set by our SIGALRM handler)
+                vcpu.set_immediate_exit(False)
+
+            # Run the vCPU - this blocks until the guest exits or SIGALRM
             if not quiet and i < 5:
                 print(f"  [vCPU run #{i}]")
             exit_reason = vcpu.run()
-
-            # Reset timeout on each successful exit
-            if not quiet:
-                signal.alarm(5)
 
             if not quiet and i < 5:
                 exit_name = vcpu.get_exit_reason_name(exit_reason)
                 print(f"  [vCPU exit: {exit_name}]")
 
             # Handle signal interruption (EINTR)
-            # This can happen if we receive a signal while in KVM_RUN
+            # In interactive mode, this happens every 100ms from our timer.
+            # We continue the loop to check stdin for input.
             if exit_reason == -1:
                 continue
 
@@ -276,7 +365,10 @@ class VMRunner:
 
             # Handle the exit based on its type
             if exit_reason == KVM_EXIT_HLT:
-                # Guest executed HLT (or WFI on ARM) - it's done
+                # Guest executed HLT instruction.
+                # Note: On ARM, WFI typically doesn't cause KVM_EXIT_HLT -
+                # KVM handles it internally. But if we do get here, treat it
+                # as the guest wanting to halt.
                 stats["hlt"] = True
                 break
 

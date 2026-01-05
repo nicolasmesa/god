@@ -5,35 +5,39 @@ The PL011 is ARM's standard UART (Universal Asynchronous Receiver/Transmitter),
 part of the PrimeCell peripheral family. It's what Linux uses when you specify
 "console=ttyAMA0" on the kernel command line.
 
-We emulate just enough for console output:
+We emulate:
 - Writes to the Data Register (DR) print characters to stdout
-- Reads from the Flag Register (FR) report transmitter ready
+- Reads from the Flag Register (FR) report transmitter/receiver status
+- Receive interrupts when input is available
 
 Reference: ARM PrimeCell UART (PL011) Technical Reference Manual
 """
 
 import sys
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from god.vm.layout import UART
 from .device import Device
 
+if TYPE_CHECKING:
+    from god.devices.gic import GIC
+
 
 class PL011UART(Device):
     """
-    PL011 UART (serial port) emulator.
+    PL011 UART (serial port) emulator with interrupt support.
 
-    This provides basic serial console functionality:
+    This provides serial console functionality:
     - Writes to DR output characters to the host terminal
-    - Reads from FR return status (transmit ready, receive empty)
-
-    The real PL011 has FIFOs, interrupts, DMA, and baud rate configuration.
-    We skip most of that complexity - our "transmission" is instant (we just
-    print to stdout), so we always report the transmit FIFO as empty.
+    - Reads from FR return status (transmit ready, receive status)
+    - Receive interrupts notify the guest when input is available
 
     Usage:
         uart = PL011UART()
         registry.register(uart)
+
+        # Later, inject input:
+        uart.inject_input(b"ls\\n")
     """
 
     # ==========================================================================
@@ -75,11 +79,21 @@ class PL011UART(Device):
     CR_TXE = 1 << 8     # Transmit Enable
     CR_RXE = 1 << 9     # Receive Enable
 
+    # ==========================================================================
+    # Interrupt Bits (for IMSC, RIS, MIS, ICR)
+    # ==========================================================================
+
+    INT_RX = 1 << 4     # Receive interrupt (RXIS)
+    INT_TX = 1 << 5     # Transmit interrupt (TXIS)
+    INT_RT = 1 << 6     # Receive timeout interrupt (RTIS)
+    INT_OE = 1 << 10    # Overrun error interrupt (OEIS)
+
     def __init__(
         self,
         output: TextIO = sys.stdout,
         base_address: int | None = None,
         size: int | None = None,
+        irq: int = 33,
     ):
         """
         Create a PL011 UART.
@@ -89,10 +103,12 @@ class PL011UART(Device):
                     You can pass a StringIO for testing.
             base_address: MMIO base address. Defaults to layout.UART.base.
             size: MMIO region size. Defaults to layout.UART.size.
+            irq: Interrupt number for the UART (default: 33 = SPI 1).
         """
         self._output = output
         self._base_address = base_address if base_address is not None else UART.base
         self._size = size if size is not None else UART.size
+        self._irq = irq
 
         # Internal register state
         # Most of these are write-only or we ignore them, but we store
@@ -104,9 +120,15 @@ class PL011UART(Device):
         self._imsc = 0        # Interrupt Mask
         self._ris = 0         # Raw Interrupt Status
 
-        # Receive buffer for future input support
+        # Receive buffer for input support
         # Characters injected via inject_input() go here
         self._rx_buffer: list[int] = []
+
+        # GIC reference for interrupt injection (set by VMRunner)
+        self._gic: "GIC | None" = None
+
+        # Track if IRQ is currently asserted (for level-triggered semantics)
+        self._irq_asserted = False
 
     @property
     def name(self) -> str:
@@ -120,13 +142,32 @@ class PL011UART(Device):
     def size(self) -> int:
         return self._size
 
+    @property
+    def irq(self) -> int:
+        """Get the IRQ number for this UART."""
+        return self._irq
+
+    def set_gic(self, gic: "GIC") -> None:
+        """
+        Set the GIC reference for interrupt injection.
+
+        This is called by VMRunner when setting up devices.
+
+        Args:
+            gic: The GIC instance to use for injecting interrupts.
+        """
+        self._gic = gic
+
     def read(self, offset: int, size: int) -> int:
         """Handle a read from the UART."""
 
         if offset == self.DR:
             # Data Register read - return received character (if any)
             if self._rx_buffer:
-                return self._rx_buffer.pop(0)
+                char = self._rx_buffer.pop(0)
+                # Update interrupt state after read
+                self._update_rx_interrupt()
+                return char
             return 0
 
         elif offset == self.FR:
@@ -201,10 +242,14 @@ class PL011UART(Device):
 
         elif offset == self.IMSC:
             self._imsc = value
+            # Mask change might affect interrupt state
+            self._update_irq_line()
 
         elif offset == self.ICR:
             # Interrupt Clear Register - clear specified interrupts
             self._ris &= ~value
+            # Update IRQ line after clearing
+            self._update_irq_line()
 
         # Other registers are read-only or not important for basic operation
 
@@ -217,16 +262,66 @@ class PL011UART(Device):
         self._imsc = 0
         self._ris = 0
         self._rx_buffer.clear()
+        self._irq_asserted = False
 
-    def inject_input(self, data: bytes):
+    def inject_input(self, data: bytes) -> None:
         """
         Inject input data into the receive buffer.
 
         This simulates receiving data on the serial port. The guest
         can then read these bytes from the Data Register.
 
+        If the guest has enabled receive interrupts (via IMSC), an IRQ
+        will be asserted to notify it of the available data.
+
         Args:
             data: Bytes to make available to the guest.
         """
         for byte in data:
             self._rx_buffer.append(byte)
+
+        # Set RX interrupt status (data available)
+        self._ris |= self.INT_RX
+
+        # Update IRQ line (will assert if guest has RX interrupts enabled)
+        self._update_irq_line()
+
+    def _update_rx_interrupt(self) -> None:
+        """
+        Update RX interrupt status based on buffer state.
+
+        Called after reading from DR to update interrupt status.
+        """
+        if self._rx_buffer:
+            # Still have data - keep interrupt set
+            self._ris |= self.INT_RX
+        else:
+            # Buffer empty - clear RX interrupt
+            self._ris &= ~self.INT_RX
+
+        self._update_irq_line()
+
+    def _update_irq_line(self) -> None:
+        """
+        Update the physical IRQ line based on interrupt state.
+
+        This implements level-triggered interrupt semantics:
+        - Assert (hold HIGH) when MIS has any bits set
+        - Deassert (release LOW) when MIS is zero
+
+        The IRQ stays asserted as long as the interrupt condition exists.
+        The guest must service the interrupt (read data) to clear it.
+        """
+        if self._gic is None:
+            return
+
+        mis = self._ris & self._imsc
+
+        if mis and not self._irq_asserted:
+            # Condition exists and line not yet asserted - assert it
+            self._gic.inject_irq(self._irq, level=True)
+            self._irq_asserted = True
+        elif not mis and self._irq_asserted:
+            # Condition cleared - deassert the line
+            self._gic.inject_irq(self._irq, level=False)
+            self._irq_asserted = False
