@@ -1213,25 +1213,53 @@ When the kernel finishes initialization, it runs `/init` (or `/sbin/init`). This
 2. Set up the environment
 3. Start services or a shell
 
+### Why We Can't Have a Shell Yet
+
+Ideally, our init script would start an interactive shell:
+
+```bash
+#!/bin/sh
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+echo "Welcome!"
+exec /bin/sh   # Start interactive shell
+```
+
+But there's a problem: **our UART only supports output, not input**. The shell would start, print a prompt, and then hang forever waiting for keyboard input that will never arrive.
+
+Our PL011 UART implementation handles writes (guest prints characters to the screen), but not reads (guest receives characters from the keyboard). Adding input support requires:
+- Buffering host stdin
+- Handling UART read registers (Data Register, Flag Register)
+- Possibly triggering interrupts when input arrives
+
+We'll implement this in Chapter 8. For now, our init script will demonstrate that boot works and then cleanly shut down:
+
 Create `initramfs/init`:
 
 ```bash
 #!/bin/sh
 
 # Mount essential filesystems
+mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
 
 # Display boot message
 echo "=========================================="
 echo "  Welcome to our VMM!"
 echo "  Linux $(uname -r) on $(uname -m)"
 echo "=========================================="
+echo
+echo "Boot successful! System running."
+echo "Halting now..."
+echo
 
-# Start an interactive shell
-exec /bin/sh
+# Clean shutdown via PSCI
+poweroff -f
 ```
+
+The `-f` flag forces immediate poweroff without init system coordination. The `poweroff` command triggers a PSCI (Power State Coordination Interface) call, which our VMM handles as a `KVM_EXIT_SYSTEM_EVENT`—a clean shutdown signal.
 
 **What are these filesystems?**
 
@@ -3079,39 +3107,56 @@ Expected output:
 ```
 Booting Linux with 1024 MB RAM
 Kernel: ./build/linux/arch/arm64/boot/Image
-Initrd: ./build/initramfs.cpio
+Initrd: ./build/initramfs.cpio.gz
 Command line: console=ttyAMA0 earlycon=pl011,0x09000000
 
 Generated Device Tree
-Loaded kernel at 0x40080000 (15728640 bytes)
-Loaded initramfs at 0x41080000 (1572864 bytes)
-Loaded DTB at 0x7fe00000 (4096 bytes)
-vCPU configured: PC=0x40080000, x0(DTB)=0x7fe00000
+  DTB initrd_start=0x48000000
+  DTB initrd_end=0x4807f6f6
+Loaded kernel at 0x40000000 (3192840 bytes)
+Loaded initramfs at 0x48000000 (521974 bytes)
+  First 8 bytes: 1f 8b 08 08 ...
+  Format: gzip compressed
+Loaded DTB at 0x48080000 (1377 bytes)
+vCPU configured: PC=0x40000000, x0(DTB)=0x48080000, VBAR=0x40010800, SP=0x48091000
 
 ============================================================
 Starting Linux...
 ============================================================
 
-[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x411fd070]
-[    0.000000] Linux version 6.12.0 ...
-[    0.000000] Machine model: linux,dummy-virt
-[    0.000000] earlycon: pl011 at MMIO 0x0000000009000000 ...
-[    0.000000] Memory: 1016352K/1048576K available ...
+Booting Linux on physical CPU 0x0000000000 [0x610f0000]
+Linux version 6.12.0 ...
+Machine model: linux,dummy-virt
+earlycon: pl11 at MMIO 0x0000000009000000 (options '')
 ...
-[    0.xxx000] Run /init as init process
+Run /init as init process
 ==========================================
   Welcome to our VMM!
   Linux 6.12.0 on aarch64
 ==========================================
 
-/ # ls
-bin   dev   etc   init  proc  root  sbin  sys   tmp
-/ # uname -a
-Linux (none) 6.12.0 #1 SMP ... aarch64 GNU/Linux
-/ #
+Boot successful! System running.
+Halting now...
+
+reboot: Power down
+
+[Guest requested shutdown/reset]
+
+============================================================
+VM stopped: SYSTEM_EVENT
+Total exits: 14130
 ```
 
 **We booted Linux!**
+
+The kernel ran our init script, printed the welcome banner, and then cleanly shut down via PSCI. The `SYSTEM_EVENT` exit indicates the guest requested a power state change—exactly what `poweroff -f` does.
+
+While we don't have an interactive shell yet (that comes in Chapter 8), this proves our entire boot chain works:
+- Kernel loaded and executed correctly
+- Device Tree parsed successfully
+- Initramfs unpacked
+- Init script ran
+- PSCI shutdown handled
 
 ## Debugging Boot Failures
 
@@ -3487,11 +3532,27 @@ In this chapter, we:
 
 ## What's Next?
 
-In Chapter 8, we'll implement **virtio**—the paravirtualization standard for efficient I/O. Our current UART works but causes a VM exit for every character. Virtio batches operations, dramatically improving performance.
+We booted Linux, but we can't interact with it—our init script just prints a message and shuts down. That's not very useful! In Chapter 8, we'll add **interactive console support** so you can actually use the shell.
 
-We'll implement:
-- **virtio-console**: Efficient serial console
-- **virtio-blk**: Block device (real filesystem!)
-- **virtio-net**: Networking
+The challenge is that our PL011 UART only handles output (guest → host). We need to implement input (host → guest):
 
-[Continue to Chapter 8: Virtio Devices →](08-virtio-devices.md)
+- **UART receive registers**: Handle guest reads from the Data Register and Flag Register
+- **Input buffering**: Capture host stdin and make it available to the guest
+- **RX interrupts**: Wake the guest when input arrives instead of busy-waiting
+
+Once complete, you'll be able to:
+```
+==========================================
+  Welcome to our VMM!
+  Linux 6.12.0 on aarch64
+==========================================
+
+/ # ls
+bin   dev   etc   init  proc  root  sbin  sys   tmp
+/ # uname -a
+Linux (none) 6.12.0 #1 SMP ... aarch64 GNU/Linux
+/ # cat /proc/cpuinfo
+...
+```
+
+[Continue to Chapter 8: Interactive Console →](08-interactive-console.md)
