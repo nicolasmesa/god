@@ -70,8 +70,8 @@ provision:
   script: |
     #!/bin/bash
     set -eux -o pipefail
-    # Create symlink so ~/workplace points to the mounted directory
-    ln -sf /path/to/workspace ~/workplace
+    # Create ~/workplace directory (mount point will be accessible via ~/workplace/veleiro-god)
+    mkdir -p ~/workplace
     # Setup rootless docker
     dockerd-rootless-setuptool.sh install
     docker context use rootless
@@ -81,9 +81,13 @@ provision:
     curl -fsSL https://claude.ai/install.sh | bash
     # Configure uv to use VM-local venv (not mounted from host)
     echo 'export UV_PROJECT_ENVIRONMENT=/opt/god/venv' >> ~/.bashrc
-    # Configure git author
-    git config --global user.email "your-email@example.com"
-    git config --global user.name "Nicolas Mesa"
+    # Configure git author (set GIT_USER_EMAIL and GIT_USER_NAME env vars before starting VM)
+    if [ -n "${GIT_USER_EMAIL:-}" ]; then
+      git config --global user.email "$GIT_USER_EMAIL"
+    fi
+    if [ -n "${GIT_USER_NAME:-}" ]; then
+      git config --global user.name "$GIT_USER_NAME"
+    fi
     # Add aliases
     echo 'alias clskip="claude --dangerously-skip-permissions"' >> ~/.bashrc
     echo 'alias god="sudo uv run --directory ~/workplace/veleiro-god god"' >> ~/.bashrc
